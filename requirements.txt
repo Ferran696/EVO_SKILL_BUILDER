@@ -1,0 +1,9 @@
+﻿streamlit
+pandas
+openpyxl
+pillow
+pymupdf
+opencv-python
+torch
+torchvision
+numpy
