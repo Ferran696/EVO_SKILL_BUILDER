@@ -1,0 +1,7 @@
+- [x] Ensure Git branch `Hristo` exists and pushed to GitHub
+- [ ] Add wide segment splitting in `auto_split_characters_by_x_histogram` via `split_wide_segments_by_valleys`
+- [ ] Improve debug dict to include threshold method, invert decision, raw/merged/split/final segments, x_projection, binary
+- [ ] Guide splitting using `expected_count` from truth length (non-hard dependency)
+- [ ] Integrate valley split controls into Streamlit Auto per Histograma-X mode (minimal UI changes)
+- [ ] Ensure Manual Canvas mode remains untouched
+- [ ] Verify no crashes on empty/tiny ROI or no detections

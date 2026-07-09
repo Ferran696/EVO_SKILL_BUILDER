@@ -495,6 +495,10 @@ def auto_split_characters_by_x_histogram(
     invert_if_needed=True,
     apply_morph_open=True,
     apply_morph_close=False,
+    enable_valley_split=False,
+    min_valley_width_px=1,
+    valley_min_depth_ratio=0.35,
+    expected_count=None,
 ):
     """
     Segmenta automàticament una ROI en caràcters mitjançant histograma X.
@@ -583,7 +587,121 @@ def auto_split_characters_by_x_histogram(
                 boxes.append((box_x1, box_y1, box_x2, box_y2))
                 crops.append(roi_img.crop((box_x1, box_y1, box_x2, box_y2)))
 
-    # TODO: Implement split_wide_segments_by_valleys for connected characters.
+    # Optional: valley split per separar caràcters connectats quan un segment surt massa ample.
+    if debug.get("merged_segments") is None:
+        # nothing to do, but keep a stable debug payload
+        debug["merged_segments"] = merged_segments
+
+    def split_wide_segments_by_valleys(
+        ink_mask: np.ndarray,          # boolean mask: ink pixels True
+        segments: list,              # list[(x1,x2)] abs coords in ink_mask axis X
+        expected_count=None,
+        min_valley_width_px: int = 1,
+        valley_min_depth_ratio: float = 0.35,
+        min_char_width: int = 3,
+    ):
+        if not segments:
+            return []
+
+        final_segments = []
+
+        for (x1, x2) in segments:
+            seg_w = x2 - x1 + 1
+            if seg_w <= max(1, min_char_width):
+                final_segments.append((x1, x2))
+                continue
+
+            seg_slice = ink_mask[:, x1:x2 + 1]
+            x_proj = np.sum(seg_slice, axis=0)
+
+            seg_max = float(np.max(x_proj)) if x_proj.size else 0.0
+            if seg_max <= 0:
+                final_segments.append((x1, x2))
+                continue
+
+            valley_cols = x_proj <= (seg_max * valley_min_depth_ratio)
+
+            valleys = []
+            in_run = False
+            run_start = 0
+            for i, v in enumerate(valley_cols):
+                if v and not in_run:
+                    in_run = True
+                    run_start = i
+                elif (not v) and in_run:
+                    in_run = False
+                    if (i - run_start) >= min_valley_width_px:
+                        valleys.append((run_start, i - 1))
+            if in_run:
+                end_i = len(valley_cols) - 1
+                if (end_i - run_start + 1) >= min_valley_width_px:
+                    valleys.append((run_start, end_i))
+
+            if not valleys:
+                final_segments.append((x1, x2))
+                continue
+
+            valley_scores = []
+            for (v1, v2) in valleys:
+                mid = (v1 + v2) // 2
+                valley_scores.append((float(x_proj[mid]), v1, v2))
+            valley_scores.sort(key=lambda t: t[0])  # valls més profundes -> menor projecció al mig
+
+            target_splits = 1
+            if expected_count is not None:
+                remaining = max(0, int(expected_count) - len(final_segments))
+                target_splits = max(1, min(len(valley_scores), remaining))
+
+            chosen = valley_scores[:target_splits]
+            cut_positions = sorted([(v1 + v2) // 2 for (_, v1, v2) in chosen])
+
+            left = x1
+            for cp in cut_positions:
+                abs_cut = x1 + cp
+                s1 = (left, abs_cut - 1)
+                if (s1[1] - s1[0] + 1) >= min_char_width:
+                    final_segments.append(s1)
+                left = abs_cut + 1
+
+            last_seg = (left, x2)
+            if (last_seg[1] - last_seg[0] + 1) >= min_char_width:
+                final_segments.append(last_seg)
+            else:
+                if final_segments:
+                    px = final_segments[-1]
+                    final_segments[-1] = (px[0], x2)
+
+        return final_segments
+
+    # Valley split (controlled by UI via function arguments)
+    if enable_valley_split:
+        # Build final segments from merged x segments
+        valley_segments = split_wide_segments_by_valleys(
+            ink_mask=ink,
+            segments=merged_segments,
+            expected_count=expected_count,
+            min_valley_width_px=int(min_valley_width_px),
+            valley_min_depth_ratio=float(valley_min_depth_ratio),
+            min_char_width=int(min_char_width),
+        )
+        debug["split_segments"] = valley_segments
+
+        # Recompute final crops/boxes from split segments
+        crops, boxes = [], []
+        for x1, x2 in valley_segments:
+            if (x2 - x1 + 1) >= min_char_width:
+                segment_slice = ink[:, x1:x2 + 1]
+                y_projection = np.sum(segment_slice, axis=1)
+                active_rows = np.where(y_projection > 0)[0]
+                if len(active_rows) > 0:
+                    y1, y2 = active_rows[0], active_rows[-1]
+                    box_x1, box_y1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
+                    box_x2, box_y2 = min(w, x2 + pad_x + 1), min(h, y2 + pad_y + 1)
+                    boxes.append((box_x1, box_y1, box_x2, box_y2))
+                    crops.append(roi_img.crop((box_x1, box_y1, box_x2, box_y2)))
+
+        debug["final_segments"] = valley_segments
+
     return crops, boxes, debug
 
 def draw_detected_boxes(roi_img: Image.Image, boxes: list):
