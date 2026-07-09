@@ -1,0 +1,17 @@
+{
+  "project_id": "cb_v2_old_20260629_135151",
+  "project_name": "CB_V2_OLD",
+  "department": "CSO",
+  "field_name": "CONTRATO Nº",
+  "alphabet": "0123456789",
+  "fixed_length": 6,
+  "roi": {
+    "x0": 0.835,
+    "y0": 0.115,
+    "x1": 0.9,
+    "y1": 0.13
+  },
+  "segmentation_mode": "fixed_slots",
+  "status": "samples_labeling_canvas",
+  "created_at": "2026-06-29T13:51:51"
+}

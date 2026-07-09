@@ -3,7 +3,8 @@ from streamlit_drawable_canvas import st_canvas
 import re
 import pandas as pd
 import csv
-# TRAINING_TEST_IMPORTS_EVO
+import cv2
+import matplotlib.pyplot as plt
 import json
 import datetime
 import random
@@ -11,7 +12,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, random_split
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageDraw, ImageFont
 from core.models import SmallCharCNN
 from core.locks import training_lock
 
@@ -32,6 +33,7 @@ from core.storage import (
 )
 from core.locks import is_locked, read_lock
 from core.utils import load_first_page_image, crop_relative, draw_roi_overlay, split_fixed_slots, crop_box_pixels, draw_char_boxes_overlay, resize_for_zoom, trim_to_ink_bbox, slot_ink_ratio
+from core.vlm import get_char_boxes_from_vlm
 
 st.set_page_config(
     page_title="EVO Skill Builder",
@@ -480,6 +482,121 @@ def save_uploaded_batch_files(pdir: Path, uploaded_files) -> Path:
     return run_dir
 
 
+# ---------- Auto-segmentation helpers ----------
+
+def auto_split_characters_by_x_histogram(
+    roi_img: Image.Image,
+    threshold_method="otsu",
+    min_char_width=3,
+    min_ink_per_col=1,
+    gap_merge_px=2,
+    pad_x=2,
+    pad_y=2,
+    invert_if_needed=True,
+    apply_morph_open=True,
+    apply_morph_close=False,
+):
+    """
+    Segmenta automàticament una ROI en caràcters mitjançant histograma X.
+    """
+    debug = {}
+    if roi_img is None or roi_img.size[0] == 0 or roi_img.size[1] == 0:
+        return [], [], {"error": "ROI image is empty."}
+
+    img_np = np.array(roi_img.copy())
+
+    if len(img_np.shape) == 3 and img_np.shape[2] == 3:
+        gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    elif len(img_np.shape) == 3 and img_np.shape[2] == 4: # RGBA
+        gray = cv2.cvtColor(img_np, cv2.COLOR_RGBA2GRAY)
+    else:
+        gray = img_np
+    debug['gray'] = Image.fromarray(gray)
+
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    if threshold_method == "adaptive":
+        binary = cv2.adaptiveThreshold(
+            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+        )
+    else:
+        _, binary = cv2.threshold(
+            blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+
+    if invert_if_needed:
+        if cv2.countNonZero(binary) > (binary.shape[0] * binary.shape[1]) // 2:
+            binary = cv2.bitwise_not(binary)
+    debug['binary_pre_morph'] = Image.fromarray(binary)
+
+    if apply_morph_open:
+        kernel = np.ones((2, 2), np.uint8)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    if apply_morph_close:
+        kernel = np.ones((2, 2), np.uint8)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    debug['binary'] = Image.fromarray(binary)
+
+    ink = binary > 0
+    x_projection = np.sum(ink, axis=0)
+    debug['x_projection'] = x_projection
+
+    active_cols = x_projection >= min_ink_per_col
+    raw_segments = []
+    is_in_segment = False
+    start_x = 0
+    for x, is_active in enumerate(active_cols):
+        if is_active and not is_in_segment:
+            is_in_segment = True
+            start_x = x
+        elif not is_active and is_in_segment:
+            is_in_segment = False
+            raw_segments.append((start_x, x - 1))
+    if is_in_segment:
+        raw_segments.append((start_x, len(active_cols) - 1))
+    debug['raw_segments'] = raw_segments
+
+    if not raw_segments:
+        return [], [], debug
+
+    merged_segments = [raw_segments[0]]
+    for i in range(1, len(raw_segments)):
+        prev_end = merged_segments[-1][1]
+        curr_start = raw_segments[i][0]
+        if (curr_start - prev_end - 1) <= gap_merge_px:
+            merged_segments[-1] = (merged_segments[-1][0], raw_segments[i][1])
+        else:
+            merged_segments.append(raw_segments[i])
+    debug['merged_segments'] = merged_segments
+
+    crops, boxes = [], []
+    h, w = gray.shape
+    for x1, x2 in merged_segments:
+        if (x2 - x1 + 1) >= min_char_width:
+            segment_slice = ink[:, x1:x2+1]
+            y_projection = np.sum(segment_slice, axis=1)
+            active_rows = np.where(y_projection > 0)[0]
+            if len(active_rows) > 0:
+                y1, y2 = active_rows[0], active_rows[-1]
+                box_x1, box_y1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
+                box_x2, box_y2 = min(w, x2 + pad_x + 1), min(h, y2 + pad_y + 1)
+                boxes.append((box_x1, box_y1, box_x2, box_y2))
+                crops.append(roi_img.crop((box_x1, box_y1, box_x2, box_y2)))
+
+    # TODO: Implement split_wide_segments_by_valleys for connected characters.
+    return crops, boxes, debug
+
+def draw_detected_boxes(roi_img: Image.Image, boxes: list):
+    if not boxes: return roi_img.copy()
+    draw_img = roi_img.copy().convert("RGB")
+    draw = ImageDraw.Draw(draw_img)
+    try: font = ImageFont.truetype("arial.ttf", 15)
+    except IOError: font = ImageFont.load_default()
+    for i, box in enumerate(boxes):
+        draw.rectangle(box, outline="green", width=1)
+        draw.text((box[0] + 2, box[1] - 16 if box[1]>16 else box[1]+2), str(i + 1), fill="red", font=font)
+    return draw_img
+
 if page == "00 · Estat":
     st.subheader("Estat general")
 
@@ -685,7 +802,9 @@ elif page == "03 · ROI bàsica":
 
 elif page == "04 · Dataset / labeling":
     st.subheader("04 · Dataset / labeling")
-    st.caption("Mode real: dibuixa amb el mouse el retall de cada caràcter. Zero geometria Gowex.")
+    st.caption(
+        "Tria un mode: manual per control total, histograma per auto-detecció, o VLM per assistència AI."
+    )
 
     import csv
     from datetime import datetime
@@ -742,9 +861,219 @@ elif page == "04 · Dataset / labeling":
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
         st.markdown("---")
-        st.markdown("### 2) Etiquetar caràcters amb mouse")
+        
+        segmentation_mode = st.radio(
+            "Mode de segmentació de caràcters",
+            ["Manual amb Canvas", "Auto per Histograma-X", "Assistit per VLM"],
+            horizontal=True,
+            key=f"seg_mode_{pdir.name}"
+        )
+        st.markdown("---")
 
-        doc = st.selectbox("Document a etiquetar", [p.name for p in docs])
+        if segmentation_mode == "Assistit per VLM":
+            st.markdown("### 🤖 Etiquetar amb assistència VLM")
+            vlm_api_key = st.text_input("Clau API del VLM (p.ex. OpenAI)", type="password", key="vlm_api_key")
+            doc_vlm = st.selectbox("Document per VLM", [p.name for p in docs], key="vlm_doc_select")
+            vlm_prompt = st.text_area(
+                "Prompt per al VLM",
+                "Ets un expert en OCR. A la imatge adjunta hi ha un codi alfanumèric. Identifica cada caràcter individualment i retorna les seves coordenades."
+            )
+
+            if st.button("Executar VLM per obtenir caixes", disabled=not vlm_api_key):
+                path_vlm = next(p for p in docs if p.name == doc_vlm)
+                img_vlm = load_first_page_image(path_vlm, dpi=150)
+                crop_vlm = crop_relative(img_vlm, roi)
+
+                try:
+                    with st.spinner("El VLM està pensant..."):
+                        vlm_result = get_char_boxes_from_vlm(crop_vlm, vlm_prompt, vlm_api_key, fixed_length)
+
+                    st.success("VLM ha retornat les caixes!")
+                    st.json(vlm_result)
+
+                    if "characters" in vlm_result and len(vlm_result["characters"]) == fixed_length:
+                        st.info("Les dades semblen correctes. Pots guardar-les.")
+                        if st.button("💾 Guardar tots els caràcters del VLM"):
+                            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            saved_count = 0
+                            for i, item in enumerate(vlm_result["characters"]):
+                                char_label = str(item["char"]).strip().upper()
+                                if char_label not in alphabet:
+                                    st.warning(f"Caràcter '{char_label}' ignorat (fora de l'alfabet).")
+                                    continue
+
+                                box_coords = item["box"]
+                                box_dict = {"x0": box_coords[0], "y0": box_coords[1], "x1": box_coords[2], "y1": box_coords[3]}
+                                char_crop = crop_box_pixels(crop_vlm, box_dict)
+
+                                class_dir = samples_dir / char_label
+                                class_dir.mkdir(parents=True, exist_ok=True)
+                                safe_stem = re.sub(r"[^A-Za-z0-9_\-]+", "_", path_vlm.stem)[:80]
+                                out_name = f"{safe_stem}_{ts}_vlm_pos{i+1:02d}_{char_label}.png"
+                                out_path = class_dir / out_name
+                                char_crop.save(out_path)
+                                saved_count += 1
+                            st.success(f"Guardats {saved_count} caràcters etiquetats pel VLM.")
+                            st.rerun()
+                except Exception as e:
+                    st.error(f"Error amb el VLM: {e}")
+
+        elif segmentation_mode == "Auto per Histograma-X":
+            st.markdown("### 🤖 Etiquetar amb Auto-segmentació per Histograma-X")
+            st.caption("Ajusta la ROI a la pàgina 03, després ajusta els paràmetres d'aquí per detectar els caràcters.")
+
+            doc = st.selectbox("Document a etiquetar", [p.name for p in docs], key=f"doc_auto_{pdir.name}")
+            path = next(p for p in docs if p.name == doc)
+
+            img = load_first_page_image(path, dpi=150)
+            crop_raw = crop_relative(img, roi)
+
+            st.markdown("#### Paràmetres de segmentació")
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                threshold_method = st.selectbox("Threshold", ["otsu", "adaptive"], key=f"th_auto_{pdir.name}")
+                apply_morph_open = st.checkbox("Neteja soroll", value=True, key=f"mo_auto_{pdir.name}")
+            with c2:
+                min_char_width = st.slider("Amplada min", 1, 30, 3, key=f"mcw_auto_{pdir.name}")
+                apply_morph_close = st.checkbox("Unir fragments", value=False, key=f"mc_auto_{pdir.name}")
+            with c3:
+                gap_merge_px = st.slider("Fusionar gaps <=", 0, 20, 2, key=f"gmp_auto_{pdir.name}")
+                min_ink_per_col = st.slider("Tinta min/col", 1, 30, 1, key=f"mipc_auto_{pdir.name}")
+            with c4:
+                pad_x = st.slider("Padding X", 0, 20, 2, key=f"px_auto_{pdir.name}")
+                pad_y = st.slider("Padding Y", 0, 20, 2, key=f"py_auto_{pdir.name}")
+
+            try:
+                crops, boxes, debug = auto_split_characters_by_x_histogram(
+                    roi_img=crop_raw, threshold_method=threshold_method, min_char_width=min_char_width,
+                    min_ink_per_col=min_ink_per_col, gap_merge_px=gap_merge_px, pad_x=pad_x, pad_y=pad_y,
+                    apply_morph_open=apply_morph_open, apply_morph_close=apply_morph_close,
+                )
+                preview = draw_detected_boxes(crop_raw, boxes)
+                
+                c_left, c_right = st.columns(2, gap="large")
+                with c_left:
+                    st.image(preview, caption=f"Auto-detecció: {len(crops)} caràcters trobats", use_container_width=True)
+                
+                with c_right:
+                    truth_raw = st.text_input(
+                        f"Valor real complet ({len(crops)} caràcters detectats)",
+                        key=f"truth_auto_{pdir.name}_{path.name}",
+                        placeholder="Escriu el text que veus a la ROI",
+                    )
+                    truth = "".join([c for c in truth_raw.strip().upper() if c in alphabet])
+
+                    if truth_raw and truth != truth_raw.strip().upper():
+                        st.warning(f"S'han eliminat caràcters fora de l'alfabet. Valor net: {truth}")
+
+                    labels, can_save, manual_labels_ok = [], False, False
+                    manual_labels = {}
+
+                    if truth:
+                        if len(truth) == len(crops):
+                            st.success(f"El text coincideix amb el número de crops ({len(truth)}). Llest per guardar.")
+                            labels = list(truth)
+                            can_save = True
+                        else:
+                            st.error(f"El text té {len(truth)} caràcters, però s'han detectat {len(crops)} crops. Ajusta paràmetres o etiqueta manualment.")
+                    
+                    if not can_save and len(crops) > 0:
+                        st.markdown("##### Etiquetatge manual per crop")
+                        cols = st.columns(min(len(crops), 5))
+                        for i in range(len(crops)):
+                            with cols[i % 5]:
+                                manual_labels[i] = st.text_input(f"Crop {i+1}", key=f"ml_{pdir.name}_{path.name}_{i}", max_chars=1).strip().upper()
+                        
+                        provided_labels = [manual_labels.get(i, "") for i in range(len(crops))]
+                        if all(provided_labels) and all(l in alphabet for l in provided_labels):
+                            labels = provided_labels
+                            truth = "".join(labels)
+                            can_save = True
+                            manual_labels_ok = True
+                            st.info("Tots els crops tenen una etiqueta manual. Llest per guardar.")
+                        elif any(provided_labels):
+                            st.warning("Completa totes les etiquetes manuals amb caràcters de l'alfabet.")
+
+                    allow_duplicate = st.checkbox("Permetre duplicats (mateix doc/valor)", value=False, key=f"dup_auto_{pdir.name}")
+                    if st.button("💾 Guardar crops etiquetats", type="primary", disabled=not can_save, use_container_width=True):
+                        already = False
+                        if labels_csv.exists() and not allow_duplicate:
+                            try:
+                                prev = pd.read_csv(labels_csv)
+                                if "source_doc" in prev.columns and "truth" in prev.columns:
+                                    already = ((prev["source_doc"] == path.name) & (prev["truth"] == truth)).any()
+                            except Exception: already = False
+
+                        if already:
+                            st.error("Aquest document amb aquest valor ja està etiquetat. Marca 'Permetre duplicats' si vols repetir.")
+                        else:
+                            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            saved_rows = []
+                            for i, (crop_img, label, box) in enumerate(zip(crops, labels, boxes)):
+                                class_dir = samples_dir / label
+                                class_dir.mkdir(parents=True, exist_ok=True)
+                                safe_stem = re.sub(r"[^A-Za-z0-9_\-]+", "_", path.stem)[:80]
+                                out_name = f"{safe_stem}_{ts}_auto_pos{i+1:02d}_{label}.png"
+                                out_path = class_dir / out_name
+                                crop_img.save(out_path)
+
+                                row = {
+                                    "timestamp": ts, "project_id": config.get("project_id"), "source_doc": path.name,
+                                    "truth": truth, "pos": i + 1, "label": label, "image_path": str(out_path),
+                                    "mode": "auto_histogram", "ink_ratio": slot_ink_ratio(crop_img, threshold=200),
+                                    "box_x0": box[0], "box_y0": box[1], "box_x1": box[2], "box_y2": box[3],
+                                    "roi_x0": roi.get("x0"), "roi_y0": roi.get("y0"), "roi_x1": roi.get("x1"), "roi_y1": roi.get("y1"),
+                                    "hist_threshold_method": threshold_method, "hist_min_char_width": min_char_width,
+                                    "hist_min_ink_per_col": min_ink_per_col, "hist_gap_merge_px": gap_merge_px,
+                                    "hist_pad_x": pad_x, "hist_pad_y": pad_y, "hist_apply_morph_open": apply_morph_open,
+                                    "hist_apply_morph_close": apply_morph_close,
+                                }
+                                saved_rows.append(row)
+
+                            if saved_rows:
+                                fieldnames = list(saved_rows[0].keys())
+                                write_header = not labels_csv.exists()
+                                with labels_csv.open("a", newline="", encoding="utf-8") as f:
+                                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                                    if write_header: writer.writeheader()
+                                    writer.writerows(saved_rows)
+
+                                config["status"] = "samples_labeling_auto"
+                                save_project_config(pdir, config)
+                                st.success(f"Guardats {len(saved_rows)} caràcters etiquetats per `{truth}`.")
+                                st.rerun()
+
+                if crops:
+                    st.markdown("#### Crops detectats")
+                    cols = st.columns(min(len(crops), 10))
+                    for i, crop in enumerate(crops):
+                        with cols[i % 10]:
+                            caption = f"Crop {i+1}"
+                            if labels and i < len(labels): caption += f" -> '{labels[i]}'"
+                            st.image(crop, caption=caption, use_container_width=True)
+
+                with st.expander("Debug histograma"):
+                    if 'binary' in debug:
+                        st.image(debug['binary'], caption="Imatge binària usada per a la projecció", use_container_width=True)
+                    if 'x_projection' in debug:
+                        st.markdown("Projecció X (suma de píxels de tinta per columna)")
+                        fig, ax = plt.subplots()
+                        ax.plot(debug['x_projection'])
+                        ax.set_title("Projecció Vertical (Histograma X)")
+                        ax.set_xlabel("Columna X"); ax.set_ylabel("Píxels de tinta")
+                        st.pyplot(fig)
+                    st.json({"raw_segments": debug.get('raw_segments', []), "merged_segments": debug.get('merged_segments', [])})
+
+            except Exception as e:
+                st.error(f"Error en la segmentació automàtica: {e}")
+                st.exception(e)
+
+        elif segmentation_mode == "Manual amb Canvas":
+            st.markdown("### ✍️ Etiquetar caràcters amb mouse (Manual)")
+            st.caption("Dibuixa amb el mouse el retall de cada caràcter. Zero geometria Gowex.")
+
+            doc = st.selectbox("Document a etiquetar", [p.name for p in docs], key=f"doc_manual_{pdir.name}")
+
         path = next(p for p in docs if p.name == doc)
 
         img = load_first_page_image(path, dpi=150)
@@ -957,7 +1286,7 @@ elif page == "04 · Dataset / labeling":
                     st.rerun()
 
         st.markdown("---")
-        st.markdown("### 3) Mostres guardades")
+        st.markdown("### Resum de mostres guardades")
 
         preview_cols = st.columns(min(len(alphabet), 10))
         for idx, ch in enumerate(alphabet):
@@ -1324,4 +1653,3 @@ elif page == "07 · Run batch":
                     detail = pred["pos_details"][i]
                     with cols[i % min(len(pred["char_crops"]), 10)]:
                         st.image(ch_img, caption=f"{detail['pos']} · {detail['pred']} · {detail['confidence']*100:.0f}%", use_container_width=True)
-
