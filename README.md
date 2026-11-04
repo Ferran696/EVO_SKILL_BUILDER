@@ -1,17 +1,17 @@
 ﻿# EVO Skill Builder
 
-Eina interna experimental per crear "skills" de lectura visual de camps documentals.
+Eina interna per crear i executar "skills" de lectura visual de camps documentals (albarans, contractes, parts) amb reindexació i exportació automàtica de fitxers.
 
-## MVP v0.1
+👉 **[Obrir la Guia Ràpida d'Usuari (Job Aid pas a pas per a tothom)](JOBAID_USUARI.md)**
 
-- ROI fixa
-- longitud fixa
-- alfabet inicial: dígits 0-9
-- entrenament d'una CNN petita per projecte
-- una feina d'entrenament a la vegada
-- validació humana obligatòria
+## Funcionalitats principals
+
+- **Enrutador Multi-Format Automàtic (`core/router.py`):** Classifica automàticament documents de Tipus 1 (Codi de barres · 7 dígits), Tipus 2 (Logo Carburos Metálicos · 6 dígits) i Tipus 3 (Excepció amb punts · 6 dígits nets).
+- **Ancoratge Visual Dinàmic i Deskewing (`core/router.py`, `core/segmentation.py`):** Localitza clústers numèrics, codis de barres i capçaleres per re-centrar la ROI encara que el document s'hagi escanejat mogut o inclinat.
+- **Segmentació Robusta (`core/segmentation.py`):** Extracció per Components Connectats i divisió per valls (`valley splitting`) per separar dígits enganxats i filtrar soroll, punts o textos paràsits.
+- **Entrenament CNN (`SmallCharCNN`):** Entrenament ràpid per projecte amb control de bloqueig de GPU (`training_lock`).
+- **Reindexació i Exportació Batch (`07 · Run batch`):** Taula interactiva amb edició de codis en temps real, previsualització del nou nom de fitxer, protecció contra duplicats i exportació directa a `.ZIP` o a carpeta local amb índex CSV de traçabilitat.
 
 ## Important
 
 No pujar documents amb dades personals o sensibles sense autorització.
-Aquesta eina és assistida i experimental.

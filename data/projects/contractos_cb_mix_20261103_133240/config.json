@@ -1,0 +1,37 @@
+{
+  "project_id": "contractos_cb_mix_20261103_133240",
+  "project_name": "CONTRACTOS_CB_MIX",
+  "department": "SCAN",
+  "field_name": "Nº de albarán",
+  "alphabet": "0123456789",
+  "fixed_length": 7,
+  "roi": {
+    "x0": 0.825,
+    "y0": 0.075,
+    "x1": 0.955,
+    "y1": 0.1
+  },
+  "segmentation_mode": "fixed_slots",
+  "status": "roi_defined",
+  "created_at": "2026-11-03T13:32:40",
+  "custom_rois": {
+    "format_3_exception": {
+      "x0": 0.785,
+      "y0": 0.105,
+      "x1": 0.925,
+      "y1": 0.14
+    },
+    "format_1_barcode": {
+      "x0": 0.83,
+      "y0": 0.076,
+      "x1": 0.948,
+      "y1": 0.098
+    },
+    "format_2_logo": {
+      "x0": 0.825,
+      "y0": 0.075,
+      "x1": 0.955,
+      "y1": 0.1
+    }
+  }
+}

@@ -2,6 +2,14 @@ from pathlib import Path
 from PIL import Image
 from io import BytesIO
 
+from core.router import classify_document_format, FORMAT_DEFINITIONS, locate_anchor_and_adjust_roi
+from core.segmentation import (
+    auto_split_characters_by_x_histogram,
+    extract_characters_by_connected_components,
+    segment_roi_characters,
+    deskew_image,
+)
+
 try:
     import fitz
     HAVE_PYMUPDF = True

@@ -1,8 +1,25 @@
 import streamlit as st
+import streamlit.elements.image as st_image
+
+# Patch de compatibilitat per a streamlit-drawable-canvas amb versions modernes de Streamlit
+if not hasattr(st_image, "image_to_url"):
+    try:
+        from streamlit.elements.lib import image_utils
+
+        def _compat_image_to_url(image, width_or_layout, clamp, channels, output_format, image_id):
+            if isinstance(width_or_layout, (int, float)):
+                layout_config = st_image.create_layout_config(width=int(width_or_layout))
+            else:
+                layout_config = width_or_layout
+            return image_utils.image_to_url(image, layout_config, clamp, channels, output_format, image_id)
+
+        st_image.image_to_url = _compat_image_to_url
+    except Exception:
+        pass
+
 from streamlit_drawable_canvas import st_canvas
 import re
 import pandas as pd
-import csv
 import cv2
 import matplotlib.pyplot as plt
 import json
@@ -24,16 +41,35 @@ from core.config import (
     RECOMMENDED_EXAMPLES_PER_CLASS,
     LOCK_FILE,
 )
+import importlib
+import core.storage as _storage_mod
+importlib.reload(_storage_mod)
 from core.storage import (
     create_project,
     list_projects,
     load_project_config,
     save_project_config,
     save_uploaded_files,
+    build_renamed_filenames,
+    build_batch_export_zip,
+    export_batch_to_folder,
 )
 from core.locks import is_locked, read_lock
 from core.utils import load_first_page_image, crop_relative, draw_roi_overlay, split_fixed_slots, crop_box_pixels, draw_char_boxes_overlay, resize_for_zoom, trim_to_ink_bbox, slot_ink_ratio
+import core.router as _router_mod
+import core.segmentation as _segmentation_mod
+importlib.reload(_router_mod)
+importlib.reload(_segmentation_mod)
+from core.router import classify_document_format, FORMAT_DEFINITIONS, locate_anchor_and_adjust_roi
+from core.segmentation import (
+    auto_split_characters_by_x_histogram,
+    extract_characters_by_connected_components,
+    segment_roi_characters,
+    split_wide_segments_by_valleys,
+    deskew_image,
+)
 from core.vlm import get_char_boxes_from_vlm
+from core.labels import append_label_rows, build_box_template_from_labels
 
 st.set_page_config(
     page_title="EVO Skill Builder",
@@ -312,53 +348,6 @@ def predict_char_image(model, alphabet: str, device, img: Image.Image) -> dict:
 
 # ---------- Runtime Batch helpers ----------
 
-def build_box_template_from_labels(pdir: Path, fixed_length: int) -> list:
-    """
-    Construeix una plantilla de caixes per posició a partir de labels.csv.
-
-    Usa els crops manuals canvas:
-    - pos / slot_idx
-    - box_x0, box_y0, box_x1, box_y1
-
-    Retorna llista ordenada pos 1..N.
-    """
-    labels_csv = pdir / "labels.csv"
-
-    if not labels_csv.exists():
-        raise RuntimeError("No existeix labels.csv. Primer etiqueta caràcters a 04 · Dataset / labeling.")
-
-    df = pd.read_csv(labels_csv)
-
-    # Compatibilitat: canvas_manual usa 'pos'; versions anteriors poden usar 'slot_idx'
-    if "pos" not in df.columns and "slot_idx" in df.columns:
-        df["pos"] = df["slot_idx"]
-
-    required = ["pos", "box_x0", "box_y0", "box_x1", "box_y1"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise RuntimeError(f"labels.csv no té columnes de caixa necessàries: {missing}")
-
-    out = []
-
-    for pos in range(1, int(fixed_length) + 1):
-        sub = df[df["pos"].astype(int) == pos]
-
-        if sub.empty:
-            raise RuntimeError(f"No hi ha cap caixa etiquetada per la posició {pos}.")
-
-        box = {
-            "pos": pos,
-            "x0": int(round(float(sub["box_x0"].mean()))),
-            "y0": int(round(float(sub["box_y0"].mean()))),
-            "x1": int(round(float(sub["box_x1"].mean()))),
-            "y1": int(round(float(sub["box_y1"].mean()))),
-            "n": int(len(sub)),
-        }
-        out.append(box)
-
-    return out
-
-
 def infer_default_trim_from_labels(pdir: Path) -> dict:
     """
     Recupera configuració d'auto-trim més recent del labels.csv.
@@ -398,24 +387,102 @@ def predict_document_code_from_path(
     model,
     alphabet: str,
     device,
-    box_template: list,
+    box_template: list = None,
     use_auto_trim: bool = True,
     trim_threshold: int = 245,
     trim_pad: int = 4,
+    use_router: bool = True,
+    segmentation_method: str = "connected_components",
+    use_anchor: bool = True,
+    use_deskew: bool = False,
 ) -> dict:
     """
-    Prediu el codi complet d'un document nou:
-    document -> ROI -> auto-trim -> caixes plantilla -> CNN per caràcter.
+    Prediu el codi complet d'un document nou.
+    Suporta dos modes:
+    1) Multi-format router (classificació dinàmica de plantilla + segmentació per components connectats / histograma + ancoratge)
+    2) Template fixa (legacy: document -> ROI estàtica -> caixes plantilla -> CNN)
     """
+    img = load_first_page_image(path, dpi=150)
+    w, h = img.size
+
+    deskew_angle = 0.0
+    if use_deskew:
+        img, deskew_angle = deskew_image(img)
+
+    if use_router:
+        format_result = classify_document_format(
+            img,
+            custom_rois=config.get("custom_rois"),
+            auto_anchor=use_anchor,
+        )
+        roi = format_result["roi"]
+        expected_len = format_result["expected_length"]
+        filter_dots = format_result["filter_dots"]
+        crop_raw = crop_relative(img, roi)
+
+        crops, boxes, debug = segment_roi_characters(
+            roi_img=crop_raw,
+            method=segmentation_method,
+            threshold_method="otsu",
+            min_char_width=3,
+            min_ink_per_col=1,
+            gap_merge_px=2,
+            pad_x=1,
+            pad_y=1,
+            enable_valley_split=True,
+            expected_count=expected_len,
+            filter_dots=filter_dots,
+        )
+
+        chars = []
+        confs = []
+        pos_details = []
+        char_crops = []
+
+        for idx, (ch_img, b) in enumerate(zip(crops, boxes), start=1):
+            pred = predict_char_image(model, alphabet, device, ch_img)
+            chars.append(pred["pred"])
+            confs.append(float(pred["confidence"]))
+            char_crops.append(ch_img)
+            pos_details.append({
+                "pos": idx,
+                "pred": pred["pred"],
+                "confidence": float(pred["confidence"]),
+                "box": {"x0": b[0], "y0": b[1], "x1": b[2], "y1": b[3]},
+                "top": pred["top"],
+            })
+
+        code = "".join(chars)
+        min_conf = min(confs) if confs else 0.0
+        avg_conf = float(sum(confs) / max(1, len(confs)))
+
+        return {
+            "file": path.name,
+            "code": code,
+            "min_conf": min_conf,
+            "avg_conf": avg_conf,
+            "pos_details": pos_details,
+            "crop_raw": crop_raw,
+            "crop": crop_raw,
+            "char_crops": char_crops,
+            "fixed_length": expected_len,
+            "format_id": format_result["format_id"],
+            "format_name": format_result["format_info"]["name"],
+            "format_confidence": format_result["confidence"],
+            "format_details": format_result,
+            "segmentation_method": segmentation_method,
+            "use_anchor": use_anchor,
+            "deskew_angle": deskew_angle,
+        }
+
+    # Legacy template mode
     roi = config.get("roi")
     fixed_length = int(config.get("fixed_length", 0) or 0)
 
     if not roi:
         raise RuntimeError("Aquest projecte no té ROI guardada.")
 
-    img = load_first_page_image(path, dpi=150)
     crop_raw = crop_relative(img, roi)
-
     if use_auto_trim:
         crop = trim_to_ink_bbox(crop_raw, threshold=int(trim_threshold), pad_px=int(trim_pad))
     else:
@@ -426,7 +493,8 @@ def predict_document_code_from_path(
     pos_details = []
     char_crops = []
 
-    for b in box_template:
+    template_boxes = box_template or []
+    for b in template_boxes:
         box = {
             "x0": b["x0"],
             "y0": b["y0"],
@@ -450,7 +518,6 @@ def predict_document_code_from_path(
         })
 
     code = "".join(chars)
-
     min_conf = min(confs) if confs else 0.0
     avg_conf = float(sum(confs) / max(1, len(confs)))
 
@@ -464,6 +531,9 @@ def predict_document_code_from_path(
         "crop": crop,
         "char_crops": char_crops,
         "fixed_length": fixed_length,
+        "format_id": "legacy_fixed_template",
+        "format_name": "Plantilla fixa estàndard",
+        "format_confidence": 1.0,
     }
 
 
@@ -481,228 +551,6 @@ def save_uploaded_batch_files(pdir: Path, uploaded_files) -> Path:
 
     return run_dir
 
-
-# ---------- Auto-segmentation helpers ----------
-
-def auto_split_characters_by_x_histogram(
-    roi_img: Image.Image,
-    threshold_method="otsu",
-    min_char_width=3,
-    min_ink_per_col=1,
-    gap_merge_px=2,
-    pad_x=2,
-    pad_y=2,
-    invert_if_needed=True,
-    apply_morph_open=True,
-    apply_morph_close=False,
-    enable_valley_split=False,
-    min_valley_width_px=1,
-    valley_min_depth_ratio=0.35,
-    expected_count=None,
-):
-    """
-    Segmenta automàticament una ROI en caràcters mitjançant histograma X.
-    """
-    debug = {}
-    if roi_img is None or roi_img.size[0] == 0 or roi_img.size[1] == 0:
-        return [], [], {"error": "ROI image is empty."}
-
-    img_np = np.array(roi_img.copy())
-
-    if len(img_np.shape) == 3 and img_np.shape[2] == 3:
-        gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-    elif len(img_np.shape) == 3 and img_np.shape[2] == 4: # RGBA
-        gray = cv2.cvtColor(img_np, cv2.COLOR_RGBA2GRAY)
-    else:
-        gray = img_np
-    debug['gray'] = Image.fromarray(gray)
-
-    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-
-    if threshold_method == "adaptive":
-        binary = cv2.adaptiveThreshold(
-            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-        )
-    else:
-        _, binary = cv2.threshold(
-            blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-        )
-
-    if invert_if_needed:
-        if cv2.countNonZero(binary) > (binary.shape[0] * binary.shape[1]) // 2:
-            binary = cv2.bitwise_not(binary)
-    debug['binary_pre_morph'] = Image.fromarray(binary)
-
-    if apply_morph_open:
-        kernel = np.ones((2, 2), np.uint8)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-    if apply_morph_close:
-        kernel = np.ones((2, 2), np.uint8)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-    debug['binary'] = Image.fromarray(binary)
-
-    ink = binary > 0
-    x_projection = np.sum(ink, axis=0)
-    debug['x_projection'] = x_projection
-
-    active_cols = x_projection >= min_ink_per_col
-    raw_segments = []
-    is_in_segment = False
-    start_x = 0
-    for x, is_active in enumerate(active_cols):
-        if is_active and not is_in_segment:
-            is_in_segment = True
-            start_x = x
-        elif not is_active and is_in_segment:
-            is_in_segment = False
-            raw_segments.append((start_x, x - 1))
-    if is_in_segment:
-        raw_segments.append((start_x, len(active_cols) - 1))
-    debug['raw_segments'] = raw_segments
-
-    if not raw_segments:
-        return [], [], debug
-
-    merged_segments = [raw_segments[0]]
-    for i in range(1, len(raw_segments)):
-        prev_end = merged_segments[-1][1]
-        curr_start = raw_segments[i][0]
-        if (curr_start - prev_end - 1) <= gap_merge_px:
-            merged_segments[-1] = (merged_segments[-1][0], raw_segments[i][1])
-        else:
-            merged_segments.append(raw_segments[i])
-    debug['merged_segments'] = merged_segments
-
-    crops, boxes = [], []
-    h, w = gray.shape
-    for x1, x2 in merged_segments:
-        if (x2 - x1 + 1) >= min_char_width:
-            segment_slice = ink[:, x1:x2+1]
-            y_projection = np.sum(segment_slice, axis=1)
-            active_rows = np.where(y_projection > 0)[0]
-            if len(active_rows) > 0:
-                y1, y2 = active_rows[0], active_rows[-1]
-                box_x1, box_y1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
-                box_x2, box_y2 = min(w, x2 + pad_x + 1), min(h, y2 + pad_y + 1)
-                boxes.append((box_x1, box_y1, box_x2, box_y2))
-                crops.append(roi_img.crop((box_x1, box_y1, box_x2, box_y2)))
-
-    # Optional: valley split per separar caràcters connectats quan un segment surt massa ample.
-    if debug.get("merged_segments") is None:
-        # nothing to do, but keep a stable debug payload
-        debug["merged_segments"] = merged_segments
-
-    def split_wide_segments_by_valleys(
-        ink_mask: np.ndarray,          # boolean mask: ink pixels True
-        segments: list,              # list[(x1,x2)] abs coords in ink_mask axis X
-        expected_count=None,
-        min_valley_width_px: int = 1,
-        valley_min_depth_ratio: float = 0.35,
-        min_char_width: int = 3,
-    ):
-        if not segments:
-            return []
-
-        final_segments = []
-
-        for (x1, x2) in segments:
-            seg_w = x2 - x1 + 1
-            if seg_w <= max(1, min_char_width):
-                final_segments.append((x1, x2))
-                continue
-
-            seg_slice = ink_mask[:, x1:x2 + 1]
-            x_proj = np.sum(seg_slice, axis=0)
-
-            seg_max = float(np.max(x_proj)) if x_proj.size else 0.0
-            if seg_max <= 0:
-                final_segments.append((x1, x2))
-                continue
-
-            valley_cols = x_proj <= (seg_max * valley_min_depth_ratio)
-
-            valleys = []
-            in_run = False
-            run_start = 0
-            for i, v in enumerate(valley_cols):
-                if v and not in_run:
-                    in_run = True
-                    run_start = i
-                elif (not v) and in_run:
-                    in_run = False
-                    if (i - run_start) >= min_valley_width_px:
-                        valleys.append((run_start, i - 1))
-            if in_run:
-                end_i = len(valley_cols) - 1
-                if (end_i - run_start + 1) >= min_valley_width_px:
-                    valleys.append((run_start, end_i))
-
-            if not valleys:
-                final_segments.append((x1, x2))
-                continue
-
-            valley_scores = []
-            for (v1, v2) in valleys:
-                mid = (v1 + v2) // 2
-                valley_scores.append((float(x_proj[mid]), v1, v2))
-            valley_scores.sort(key=lambda t: t[0])  # valls més profundes -> menor projecció al mig
-
-            target_splits = 1
-            if expected_count is not None:
-                remaining = max(0, int(expected_count) - len(final_segments))
-                target_splits = max(1, min(len(valley_scores), remaining))
-
-            chosen = valley_scores[:target_splits]
-            cut_positions = sorted([(v1 + v2) // 2 for (_, v1, v2) in chosen])
-
-            left = x1
-            for cp in cut_positions:
-                abs_cut = x1 + cp
-                s1 = (left, abs_cut - 1)
-                if (s1[1] - s1[0] + 1) >= min_char_width:
-                    final_segments.append(s1)
-                left = abs_cut + 1
-
-            last_seg = (left, x2)
-            if (last_seg[1] - last_seg[0] + 1) >= min_char_width:
-                final_segments.append(last_seg)
-            else:
-                if final_segments:
-                    px = final_segments[-1]
-                    final_segments[-1] = (px[0], x2)
-
-        return final_segments
-
-    # Valley split (controlled by UI via function arguments)
-    if enable_valley_split:
-        # Build final segments from merged x segments
-        valley_segments = split_wide_segments_by_valleys(
-            ink_mask=ink,
-            segments=merged_segments,
-            expected_count=expected_count,
-            min_valley_width_px=int(min_valley_width_px),
-            valley_min_depth_ratio=float(valley_min_depth_ratio),
-            min_char_width=int(min_char_width),
-        )
-        debug["split_segments"] = valley_segments
-
-        # Recompute final crops/boxes from split segments
-        crops, boxes = [], []
-        for x1, x2 in valley_segments:
-            if (x2 - x1 + 1) >= min_char_width:
-                segment_slice = ink[:, x1:x2 + 1]
-                y_projection = np.sum(segment_slice, axis=1)
-                active_rows = np.where(y_projection > 0)[0]
-                if len(active_rows) > 0:
-                    y1, y2 = active_rows[0], active_rows[-1]
-                    box_x1, box_y1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
-                    box_x2, box_y2 = min(w, x2 + pad_x + 1), min(h, y2 + pad_y + 1)
-                    boxes.append((box_x1, box_y1, box_x2, box_y2))
-                    crops.append(roi_img.crop((box_x1, box_y1, box_x2, box_y2)))
-
-        debug["final_segments"] = valley_segments
-
-    return crops, boxes, debug
 
 def draw_detected_boxes(roi_img: Image.Image, boxes: list):
     if not boxes: return roi_img.copy()
@@ -815,7 +663,11 @@ elif page == "03 · ROI bàsica":
             img = load_first_page_image(path, dpi=130)
             w, h = img.size
 
-            current_roi = config.get("roi") or {
+            doc_fmt = classify_document_format(img, custom_rois=config.get("custom_rois"))
+            fmt_info = doc_fmt["format_info"]
+            st.info(f"Format detectat pel Router: **{fmt_info['name']}** (Longitud esperada: **{doc_fmt['expected_length']}** caràcters)")
+
+            current_roi = doc_fmt["roi"] or config.get("roi") or {
                 "x0": 0.50,
                 "y0": 0.00,
                 "x1": 0.98,
@@ -826,14 +678,14 @@ elif page == "03 · ROI bàsica":
             st.info("Mou sliders i mira el rectangle vermell i el crop ampliat. Quan el crop contingui només el camp/codi, guarda ROI.")
 
             # Presets ràpids per no començar des de zero
-            p1, p2, p3, p4 = st.columns(4)
+            p0, p1, p2, p3 = st.columns(4)
+            if p0.button("Preset: Recomanat format"):
+                current_roi = doc_fmt["roi"]
             if p1.button("Preset: superior dreta"):
                 current_roi = {"x0": 0.55, "y0": 0.00, "x1": 0.98, "y1": 0.22}
             if p2.button("Preset: capçalera ampla"):
                 current_roi = {"x0": 0.25, "y0": 0.00, "x1": 0.98, "y1": 0.28}
-            if p3.button("Preset: centre dreta"):
-                current_roi = {"x0": 0.45, "y0": 0.20, "x1": 0.98, "y1": 0.55}
-            if p4.button("Preset: full ample"):
+            if p3.button("Preset: full ample"):
                 current_roi = {"x0": 0.00, "y0": 0.00, "x1": 1.00, "y1": 0.35}
 
             c_img, c_sliders = st.columns([1.25, 1.0], gap="large")
@@ -870,9 +722,12 @@ elif page == "03 · ROI bàsica":
 
                 if st.button("💾 Guardar ROI", type="primary", use_container_width=True):
                     config["roi"] = roi
+                    if "custom_rois" not in config or not isinstance(config["custom_rois"], dict):
+                        config["custom_rois"] = {}
+                    config["custom_rois"][doc_fmt["format_id"]] = roi
                     config["status"] = "roi_defined"
                     save_project_config(pdir, config)
-                    st.success("ROI guardada.")
+                    st.success(f"ROI guardada per al format {fmt_info['name']}.")
                     st.json(roi)
 
             with c_img:
@@ -924,7 +779,6 @@ elif page == "04 · Dataset / labeling":
         "Tria un mode: manual per control total, histograma per auto-detecció, o VLM per assistència AI."
     )
 
-    import csv
     from datetime import datetime
 
     pdir, config = select_project()
@@ -1000,16 +854,19 @@ elif page == "04 · Dataset / labeling":
             if st.button("Executar VLM per obtenir caixes", disabled=not vlm_api_key):
                 path_vlm = next(p for p in docs if p.name == doc_vlm)
                 img_vlm = load_first_page_image(path_vlm, dpi=150)
-                crop_vlm = crop_relative(img_vlm, roi)
+                vlm_fmt = classify_document_format(img_vlm, custom_rois=config.get("custom_rois"))
+                vlm_expected_len = vlm_fmt.get("expected_length", fixed_length)
+                vlm_roi = vlm_fmt.get("roi", roi)
+                crop_vlm = crop_relative(img_vlm, vlm_roi)
 
                 try:
                     with st.spinner("El VLM està pensant..."):
-                        vlm_result = get_char_boxes_from_vlm(crop_vlm, vlm_prompt, vlm_api_key, fixed_length)
+                        vlm_result = get_char_boxes_from_vlm(crop_vlm, vlm_prompt, vlm_api_key, vlm_expected_len)
 
                     st.success("VLM ha retornat les caixes!")
                     st.json(vlm_result)
 
-                    if "characters" in vlm_result and len(vlm_result["characters"]) == fixed_length:
+                    if "characters" in vlm_result and len(vlm_result["characters"]) == vlm_expected_len:
                         st.info("Les dades semblen correctes. Pots guardar-les.")
                         if st.button("💾 Guardar tots els caràcters del VLM"):
                             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1044,7 +901,12 @@ elif page == "04 · Dataset / labeling":
             path = next(p for p in docs if p.name == doc)
 
             img = load_first_page_image(path, dpi=150)
-            crop_raw = crop_relative(img, roi)
+            doc_fmt = classify_document_format(img, custom_rois=config.get("custom_rois"))
+            doc_expected_len = doc_fmt.get("expected_length", fixed_length)
+            doc_roi = doc_fmt.get("roi", roi)
+            st.info(f"Format detectat: **{doc_fmt['format_info']['name']}** (Esperats: **{doc_expected_len}** caràcters)")
+
+            crop_raw = crop_relative(img, doc_roi)
 
             st.markdown("#### Paràmetres de segmentació")
             c1, c2, c3, c4 = st.columns(4)
@@ -1066,6 +928,8 @@ elif page == "04 · Dataset / labeling":
                     roi_img=crop_raw, threshold_method=threshold_method, min_char_width=min_char_width,
                     min_ink_per_col=min_ink_per_col, gap_merge_px=gap_merge_px, pad_x=pad_x, pad_y=pad_y,
                     apply_morph_open=apply_morph_open, apply_morph_close=apply_morph_close,
+                    expected_count=doc_expected_len,
+                    filter_dots=doc_fmt.get("filter_dots", False),
                 )
                 preview = draw_detected_boxes(crop_raw, boxes)
                 
@@ -1139,7 +1003,7 @@ elif page == "04 · Dataset / labeling":
                                     "timestamp": ts, "project_id": config.get("project_id"), "source_doc": path.name,
                                     "truth": truth, "pos": i + 1, "label": label, "image_path": str(out_path),
                                     "mode": "auto_histogram", "ink_ratio": slot_ink_ratio(crop_img, threshold=200),
-                                    "box_x0": box[0], "box_y0": box[1], "box_x1": box[2], "box_y2": box[3],
+                                    "box_x0": box[0], "box_y0": box[1], "box_x1": box[2], "box_y1": box[3],
                                     "roi_x0": roi.get("x0"), "roi_y0": roi.get("y0"), "roi_x1": roi.get("x1"), "roi_y1": roi.get("y1"),
                                     "hist_threshold_method": threshold_method, "hist_min_char_width": min_char_width,
                                     "hist_min_ink_per_col": min_ink_per_col, "hist_gap_merge_px": gap_merge_px,
@@ -1149,12 +1013,7 @@ elif page == "04 · Dataset / labeling":
                                 saved_rows.append(row)
 
                             if saved_rows:
-                                fieldnames = list(saved_rows[0].keys())
-                                write_header = not labels_csv.exists()
-                                with labels_csv.open("a", newline="", encoding="utf-8") as f:
-                                    writer = csv.DictWriter(f, fieldnames=fieldnames)
-                                    if write_header: writer.writeheader()
-                                    writer.writerows(saved_rows)
+                                append_label_rows(labels_csv, saved_rows)
 
                                 config["status"] = "samples_labeling_auto"
                                 save_project_config(pdir, config)
@@ -1195,7 +1054,12 @@ elif page == "04 · Dataset / labeling":
         path = next(p for p in docs if p.name == doc)
 
         img = load_first_page_image(path, dpi=150)
-        crop_raw = crop_relative(img, roi)
+        doc_fmt = classify_document_format(img, custom_rois=config.get("custom_rois"))
+        doc_expected_len = doc_fmt.get("expected_length", fixed_length)
+        doc_roi = doc_fmt.get("roi", roi)
+        st.info(f"Format detectat: **{doc_fmt['format_info']['name']}** (Esperats: **{doc_expected_len}** caràcters)")
+
+        crop_raw = crop_relative(img, doc_roi)
 
         c_cfg1, c_cfg2, c_cfg3, c_cfg4 = st.columns(4)
 
@@ -1206,7 +1070,11 @@ elif page == "04 · Dataset / labeling":
         with c_cfg3:
             trim_pad = st.slider("Padding trim px", 0, 30, 4, 1)
         with c_cfg4:
-            zoom = st.slider("Zoom canvas", 3, 16, 8, 1)
+            # Zoom adaptatiu per defecte per evitar que el canvas es talli a la columna
+            crop_sample = trim_to_ink_bbox(crop_raw, threshold=trim_threshold, pad_px=trim_pad) if use_auto_trim else crop_raw
+            w_sample = max(1, crop_sample.size[0])
+            ideal_zoom = min(6, max(2, int(680 / w_sample)))
+            zoom = st.slider("Zoom canvas", 1, 12, ideal_zoom, 1)
 
         if use_auto_trim:
             crop = trim_to_ink_bbox(crop_raw, threshold=trim_threshold, pad_px=trim_pad)
@@ -1216,9 +1084,9 @@ elif page == "04 · Dataset / labeling":
         cw, ch = crop.size
 
         truth_raw = st.text_input(
-            f"Valor real complet ({fixed_length} caràcters)",
+            f"Valor real complet ({doc_expected_len} caràcters per a {doc_fmt['format_info']['name']})",
             key=f"truth_canvas_{pdir.name}_{path.name}",
-            placeholder="7000177418",
+            placeholder=f"P.ex. {'0528158' if doc_expected_len == 7 else '515159'}",
         )
 
         truth = "".join([c for c in truth_raw.strip().upper() if c in alphabet])
@@ -1226,12 +1094,13 @@ elif page == "04 · Dataset / labeling":
         if truth_raw and truth != truth_raw.strip().upper():
             st.warning(f"S'han eliminat caràcters fora de l'alfabet. Valor net: {truth}")
 
-        valid_truth = len(truth) == fixed_length
+        valid_truth = len(truth) > 0 and (len(truth) == doc_expected_len or len(truth) in [6, 7] or len(truth) == fixed_length)
+        target_length = len(truth) if (truth and len(truth) > 0) else doc_expected_len
 
         if truth and not valid_truth:
-            st.error(f"Longitud incorrecta: {len(truth)}. Aquest projecte espera {fixed_length}.")
+            st.error(f"Longitud incorrecta: {len(truth)}. S'esperen {doc_expected_len} caràcters per a {doc_fmt['format_info']['name']}.")
         elif valid_truth:
-            st.success(f"Valor vàlid: {truth}")
+            st.success(f"Valor vàlid: {truth} ({len(truth)} caràcters)")
 
         # Estat posició activa
         active_key = f"active_char_idx_canvas_{pdir.name}_{path.name}"
@@ -1239,20 +1108,20 @@ elif page == "04 · Dataset / labeling":
             st.session_state[active_key] = 0
 
         active_idx = int(st.session_state[active_key])
-        active_idx = max(0, min(fixed_length - 1, active_idx))
-        expected_label = truth[active_idx] if valid_truth else ""
+        active_idx = max(0, min(target_length - 1, active_idx))
+        expected_label = truth[active_idx] if (valid_truth and active_idx < len(truth)) else ""
 
-        c_left, c_right = st.columns([1.35, 1.0], gap="large")
+        canvas_img = resize_for_zoom(crop, zoom=zoom)
+        canvas_w, canvas_h = canvas_img.size
+
+        c_left, c_right = st.columns([1.6, 1.0], gap="large")
 
         with c_left:
             st.markdown("#### ROI raw")
             st.image(crop_raw, caption=f"ROI original · {crop_raw.size[0]} x {crop_raw.size[1]} px", use_container_width=False)
 
             st.markdown("#### Canvas ampliat")
-            st.caption("Dibuixa UN rectangle al voltant del caràcter actiu. Si surt malament, usa 'Reset canvas'.")
-
-            canvas_img = resize_for_zoom(crop, zoom=zoom)
-            canvas_w, canvas_h = canvas_img.size
+            st.caption(f"Dibuixa UN rectangle al voltant del caràcter actiu (Canvas: {canvas_w}x{canvas_h} px). Si queda tallat, redueix el 'Zoom canvas'.")
 
             canvas_rev_key = f"canvas_rev_{pdir.name}_{path.name}_{active_idx}"
             if canvas_rev_key not in st.session_state:
@@ -1276,7 +1145,7 @@ elif page == "04 · Dataset / labeling":
             pos = st.number_input(
                 "Posició",
                 min_value=1,
-                max_value=fixed_length,
+                max_value=max(1, target_length),
                 value=active_idx + 1,
                 step=1,
             )
@@ -1287,7 +1156,7 @@ elif page == "04 · Dataset / labeling":
                 st.rerun()
 
             if valid_truth:
-                st.info(f"Posició {active_idx + 1}/{fixed_length} → etiqueta: `{expected_label}`")
+                st.info(f"Posició {active_idx + 1}/{target_length} → etiqueta: `{expected_label}`")
             else:
                 st.warning("Escriu primer el valor real complet per saber l'etiqueta del caràcter.")
 
@@ -1334,8 +1203,8 @@ elif page == "04 · Dataset / labeling":
                 st.session_state[active_key] = max(0, active_idx - 1)
                 st.rerun()
 
-            if nav2.button("➡️ Següent", use_container_width=True, disabled=active_idx >= fixed_length - 1):
-                st.session_state[active_key] = min(fixed_length - 1, active_idx + 1)
+            if nav2.button("➡️ Següent", use_container_width=True, disabled=active_idx >= target_length - 1):
+                st.session_state[active_key] = min(target_length - 1, active_idx + 1)
                 st.rerun()
 
             if nav3.button("🧽 Reset canvas", use_container_width=True):
@@ -1385,12 +1254,7 @@ elif page == "04 · Dataset / labeling":
                         "zoom": zoom,
                     }
 
-                    write_header = not labels_csv.exists()
-                    with labels_csv.open("a", newline="", encoding="utf-8") as f:
-                        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
-                        if write_header:
-                            writer.writeheader()
-                        writer.writerow(row)
+                    append_label_rows(labels_csv, [row])
 
                     config["status"] = "samples_labeling_canvas"
                     save_project_config(pdir, config)
@@ -1398,7 +1262,7 @@ elif page == "04 · Dataset / labeling":
                     st.success(f"Guardat pos {active_idx+1}: `{expected_label}`")
 
                     # auto-next i canvas net
-                    if active_idx < fixed_length - 1:
+                    if active_idx < target_length - 1:
                         st.session_state[active_key] = active_idx + 1
                     st.session_state[canvas_rev_key] += 1
                     st.rerun()
@@ -1630,19 +1494,64 @@ elif page == "07 · Run batch":
 
         trim_defaults = infer_default_trim_from_labels(pdir)
 
-        st.markdown("### 1) Plantilla de caixes runtime")
-        st.dataframe(pd.DataFrame(box_template), use_container_width=True, hide_index=True)
+        st.markdown("### 1) Plantilla de caixes runtime i Mode d'execució")
+        inference_mode = st.radio(
+            "Estratègia de lectura",
+            [
+                "🔄 Enrutador multi-format automàtic (Router + Segmentació Dinàmica)",
+                "📐 Plantilla de caixes fixa (Legacy)"
+            ],
+            index=0,
+            help="L'enrutador classifica automàticament si és Tipus 1 (Barcode), Tipus 2 (Logo Carburos) o Tipus 3 (Excepció amb punts filtrats)."
+        )
+        use_router = inference_mode.startswith("🔄")
+
+        if not use_router:
+            st.dataframe(pd.DataFrame(box_template), use_container_width=True, hide_index=True)
+        else:
+            st.info("ℹ️ Mode Multi-Format actiu: s'identificarà cada document per plantilla (Tipus 1: 7 caràcters, Tipus 2: 6 caràcters, Tipus 3: 6 caràcters nets filtrant punts).")
 
         st.markdown("### 2) Configuració runtime")
+
+        if use_router:
+            with st.expander("⚙️ Opcions avançades de lectura (Segmentació i Alineació)", expanded=True):
+                f_col1, f_col2, f_col3 = st.columns(3)
+                with f_col1:
+                    seg_label = st.selectbox(
+                        "Mètode de segmentació",
+                        [
+                            "🔲 Components Connectats (Robust a desplaçaments)",
+                            "📊 Histograma X clàssic (Projecció vertical)",
+                        ],
+                        index=0,
+                        help="Components Connectats analitza formes i descarta taques o textos paràsits de manera intel·ligent."
+                    )
+                    segmentation_method = "connected_components" if seg_label.startswith("🔲") else "histogram"
+                with f_col2:
+                    use_anchor = st.checkbox(
+                        "🎯 Ancoratge visual automàtic",
+                        value=True,
+                        help="Re-centra la ROI automàticament trobant el codi de barres, logo o línia de text si l'escaneig està mogut."
+                    )
+                with f_col3:
+                    use_deskew = st.checkbox(
+                        "📐 Deskewing (Alineació d'inclinació)",
+                        value=False,
+                        help="Detecta i corregeix petits angles de rotació en documents escanejats torts."
+                    )
+        else:
+            segmentation_method = "histogram"
+            use_anchor = False
+            use_deskew = False
 
         c1, c2, c3, c4 = st.columns(4)
 
         with c1:
-            use_auto_trim = st.checkbox("Auto-trim", value=trim_defaults.get("auto_trim", True))
+            use_auto_trim = st.checkbox("Auto-trim", value=trim_defaults.get("auto_trim", True), disabled=use_router)
         with c2:
-            trim_threshold = st.slider("Threshold tinta", 180, 255, int(trim_defaults.get("trim_threshold", 245)), 1)
+            trim_threshold = st.slider("Threshold tinta", 180, 255, int(trim_defaults.get("trim_threshold", 245)), 1, disabled=use_router)
         with c3:
-            trim_pad = st.slider("Padding trim px", 0, 30, int(trim_defaults.get("trim_pad", 4)), 1)
+            trim_pad = st.slider("Padding trim px", 0, 30, int(trim_defaults.get("trim_pad", 4)), 1, disabled=use_router)
         with c4:
             min_conf_threshold = st.slider("Min conf OK", 0.0, 1.0, 0.70, 0.05)
 
@@ -1681,6 +1590,10 @@ elif page == "07 · Run batch":
                                 use_auto_trim=use_auto_trim,
                                 trim_threshold=trim_threshold,
                                 trim_pad=trim_pad,
+                                use_router=use_router,
+                                segmentation_method=segmentation_method,
+                                use_anchor=use_anchor,
+                                use_deskew=use_deskew,
                             )
 
                             status = "OK" if (
@@ -1689,8 +1602,10 @@ elif page == "07 · Run batch":
                             ) else "REVIEW"
 
                             row = {
+                                "exportar": status == "OK",
                                 "fitxer": pred["file"],
                                 "codi": pred["code"],
+                                "format": pred.get("format_name", "N/A"),
                                 "min_conf": round(pred["min_conf"], 4),
                                 "avg_conf": round(pred["avg_conf"], 4),
                                 "status": status,
@@ -1701,8 +1616,10 @@ elif page == "07 · Run batch":
 
                         except Exception as e:
                             results.append({
+                                "exportar": False,
                                 "fitxer": path.name,
                                 "codi": "",
+                                "format": "ERROR",
                                 "min_conf": 0.0,
                                 "avg_conf": 0.0,
                                 "status": "ERROR",
@@ -1714,6 +1631,7 @@ elif page == "07 · Run batch":
                     st.session_state["run_batch_results"] = results
                     st.session_state["run_batch_details"] = detail_store
                     st.session_state["run_batch_dir"] = str(run_dir)
+                    st.session_state["run_batch_editor_rev"] = st.session_state.get("run_batch_editor_rev", 0) + 1
 
                     st.success("Batch processat.")
 
@@ -1722,22 +1640,198 @@ elif page == "07 · Run batch":
 
         results = st.session_state.get("run_batch_results", [])
         details = st.session_state.get("run_batch_details", {})
+        run_batch_dir = st.session_state.get("run_batch_dir", "")
 
         if results:
             st.markdown("---")
-            st.markdown("### 4) Resultats batch")
+            st.markdown("### 4) Resultats batch, Reindexació i Exportació")
+            st.caption("Revisa o edita els codis detectats, marca els documents que vols reindexar i exporta'ls ja reanomenats.")
 
-            df_res = pd.DataFrame(results)
-            st.dataframe(df_res, use_container_width=True, hide_index=True)
+            # Garantir compatibilitat si hi ha resultats previs en sessió sense camp 'exportar'
+            for r in results:
+                if "exportar" not in r:
+                    r["exportar"] = (r.get("status") == "OK" and bool(r.get("codi")))
 
-            csv_bytes = df_res.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-            st.download_button(
-                "⬇️ Descarregar resultats CSV",
-                data=csv_bytes,
-                file_name="evo_skill_batch_results.csv",
-                mime="text/csv",
-                use_container_width=True,
+            cfg_c1, cfg_c2, sel_c1, sel_c2, sel_c3 = st.columns([1.6, 1.2, 0.9, 0.9, 0.9])
+            with cfg_c1:
+                pattern_label = st.selectbox(
+                    "Patró de nou nom",
+                    [
+                        "{codi}.ext (p.ex. 0529820.pdf)",
+                        "{prefix}{codi}.ext (p.ex. ALB_0529820.pdf)",
+                        "{codi}_{original}.ext (p.ex. 0529820_18.pdf)",
+                    ],
+                    index=0,
+                    key="batch_rename_pattern_select",
+                )
+                if pattern_label.startswith("{prefix}"):
+                    pattern_key = "{prefix}{codi}"
+                elif pattern_label.startswith("{codi}_{original}"):
+                    pattern_key = "{codi}_{original}"
+                else:
+                    pattern_key = "{codi}"
+
+            with cfg_c2:
+                prefix_val = st.text_input(
+                    "Prefix opcional",
+                    value="ALB_",
+                    disabled=(pattern_key != "{prefix}{codi}"),
+                    key="batch_rename_prefix_input",
+                )
+
+            with sel_c1:
+                st.write("")
+                if st.button("✅ Seleccionar tots", use_container_width=True):
+                    for r in st.session_state["run_batch_results"]:
+                        r["exportar"] = (r.get("status") != "ERROR" and bool(str(r.get("codi", "")).strip()))
+                    st.session_state["run_batch_editor_rev"] = st.session_state.get("run_batch_editor_rev", 0) + 1
+                    st.rerun()
+
+            with sel_c2:
+                st.write("")
+                if st.button("☑️ Només OK", use_container_width=True):
+                    for r in st.session_state["run_batch_results"]:
+                        r["exportar"] = (r.get("status") == "OK")
+                    st.session_state["run_batch_editor_rev"] = st.session_state.get("run_batch_editor_rev", 0) + 1
+                    st.rerun()
+
+            with sel_c3:
+                st.write("")
+                if st.button("🚫 Desmarcar tots", use_container_width=True):
+                    for r in st.session_state["run_batch_results"]:
+                        r["exportar"] = False
+                    st.session_state["run_batch_editor_rev"] = st.session_state.get("run_batch_editor_rev", 0) + 1
+                    st.rerun()
+
+            rows_for_editor = build_renamed_filenames(
+                results,
+                pattern=pattern_key,
+                prefix=prefix_val if pattern_key == "{prefix}{codi}" else "",
             )
+
+            col_order = ["exportar", "fitxer", "codi", "nou_nom", "format", "min_conf", "avg_conf", "status"]
+            if any("error" in r for r in rows_for_editor):
+                col_order.append("error")
+
+            df_editor_in = pd.DataFrame(rows_for_editor)
+            for c in col_order:
+                if c not in df_editor_in.columns:
+                    df_editor_in[c] = ""
+            df_editor_in = df_editor_in[col_order]
+
+            editor_rev = st.session_state.get("run_batch_editor_rev", 0)
+            edited_df = st.data_editor(
+                df_editor_in,
+                column_config={
+                    "exportar": st.column_config.CheckboxColumn(
+                        "Exportar",
+                        help="Marca per reindexar i exportar aquest document",
+                        default=True,
+                    ),
+                    "fitxer": st.column_config.TextColumn("Fitxer original", disabled=True),
+                    "codi": st.column_config.TextColumn(
+                        "Codi (editable)",
+                        help="Pots corregir manualment el codi predit abans d'exportar",
+                    ),
+                    "nou_nom": st.column_config.TextColumn(
+                        "Nou nom fitxer",
+                        help="Nom final amb gestió automàtica de col·lisions",
+                        disabled=True,
+                    ),
+                    "format": st.column_config.TextColumn("Format", disabled=True),
+                    "min_conf": st.column_config.NumberColumn("Min conf", format="%.4f", disabled=True),
+                    "avg_conf": st.column_config.NumberColumn("Avg conf", format="%.4f", disabled=True),
+                    "status": st.column_config.TextColumn("Status", disabled=True),
+                },
+                use_container_width=True,
+                hide_index=True,
+                key=f"batch_results_editor_{editor_rev}",
+            )
+
+            # Sincronitzar edicions d'usuari (checkbox 'exportar' i correccions de 'codi')
+            edited_records = edited_df.to_dict(orient="records")
+            code_changed = False
+            for idx, rec in enumerate(edited_records):
+                if idx < len(results):
+                    new_exp = bool(rec.get("exportar", False))
+                    new_code = str(rec.get("codi", "") or "").strip()
+                    if results[idx].get("codi") != new_code:
+                        code_changed = True
+                    results[idx]["exportar"] = new_exp
+                    results[idx]["codi"] = new_code
+                    fname = results[idx].get("fitxer")
+                    if fname and fname in details:
+                        details[fname]["code"] = new_code
+
+            final_rows = build_renamed_filenames(
+                results,
+                pattern=pattern_key,
+                prefix=prefix_val if pattern_key == "{prefix}{codi}" else "",
+            )
+            if code_changed:
+                st.session_state["run_batch_editor_rev"] = editor_rev + 1
+                st.rerun()
+
+            df_res = pd.DataFrame(final_rows)
+            selected_rows = [r for r in final_rows if bool(r.get("exportar", False))]
+            n_selected = len(selected_rows)
+
+            st.info(f"📌 **{n_selected} de {len(final_rows)}** documents seleccionats per reindexar i exportar.")
+
+            exp_col1, exp_col2, exp_col3 = st.columns([1.2, 1.2, 1.0], gap="medium")
+
+            with exp_col1:
+                if run_batch_dir and Path(run_batch_dir).exists() and n_selected > 0:
+                    zip_bytes = build_batch_export_zip(Path(run_batch_dir), final_rows)
+                    batch_ts = Path(run_batch_dir).name
+                    st.download_button(
+                        f"📦 Descarregar ZIP reanomenat ({n_selected} docs)",
+                        data=zip_bytes,
+                        file_name=f"export_{pdir.name}_{batch_ts}.zip",
+                        mime="application/zip",
+                        type="primary",
+                        use_container_width=True,
+                    )
+                else:
+                    st.button(
+                        "📦 Descarregar ZIP reanomenat (0 docs)",
+                        disabled=True,
+                        use_container_width=True,
+                    )
+
+            with exp_col2:
+                csv_bytes = df_res.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+                st.download_button(
+                    "⬇️ Descarregar taula resultats CSV",
+                    data=csv_bytes,
+                    file_name="evo_skill_batch_results.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+
+            with exp_col3:
+                default_export_dir = str(pdir / "exports" / (Path(run_batch_dir).name if run_batch_dir else "latest"))
+                with st.popover("📁 Exportar a carpeta local", use_container_width=True):
+                    target_dir_str = st.text_input(
+                        "Ruta carpeta destinació",
+                        value=default_export_dir,
+                        key="batch_export_target_dir",
+                    )
+                    if st.button(
+                        f"💾 Copiar {n_selected} fitxers reanomenats",
+                        type="primary",
+                        disabled=(n_selected == 0 or not run_batch_dir or not Path(run_batch_dir).exists()),
+                        use_container_width=True,
+                    ):
+                        try:
+                            summary = export_batch_to_folder(
+                                source_dir=Path(run_batch_dir),
+                                target_dir=Path(target_dir_str),
+                                rows=final_rows,
+                            )
+                            st.success(f"Exportats {summary['copied_count']} fitxers a:\n`{summary['target_dir']}`")
+                        except Exception as e:
+                            st.error(f"Error exportant a carpeta: {e}")
 
             st.markdown("### 5) Detall visual")
 
@@ -1748,6 +1842,8 @@ elif page == "07 · Run batch":
                 pred = details[selected_file]
 
                 st.markdown(f"#### `{selected_file}` → `{pred['code']}`")
+                if "format_name" in pred:
+                    st.info(f"**Format detectat:** {pred['format_name']} (confiança: {pred.get('format_confidence', 1.0)*100:.1f}%)")
                 st.caption(f"min_conf={pred['min_conf']:.3f} · avg_conf={pred['avg_conf']:.3f}")
 
                 c_left, c_right = st.columns([1.0, 1.2], gap="large")
@@ -1766,8 +1862,8 @@ elif page == "07 · Run batch":
                     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
                 st.markdown("#### Crops per posició")
-                cols = st.columns(min(len(pred["char_crops"]), 10))
+                cols = st.columns(min(max(1, len(pred["char_crops"])), 10))
                 for i, ch_img in enumerate(pred["char_crops"]):
                     detail = pred["pos_details"][i]
-                    with cols[i % min(len(pred["char_crops"]), 10)]:
+                    with cols[i % min(max(1, len(pred["char_crops"])), 10)]:
                         st.image(ch_img, caption=f"{detail['pos']} · {detail['pred']} · {detail['confidence']*100:.0f}%", use_container_width=True)

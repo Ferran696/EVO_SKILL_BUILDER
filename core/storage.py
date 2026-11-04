@@ -1,6 +1,9 @@
 ﻿import json
+import csv
+import io
 import re
 import shutil
+import zipfile
 from pathlib import Path
 from datetime import datetime
 from core.config import PROJECTS_DIR, SKILLS_DIR, REGISTRY_FILE
@@ -73,3 +76,163 @@ def load_registry() -> list:
 def save_registry(items: list):
     REGISTRY_FILE.parent.mkdir(parents=True, exist_ok=True)
     REGISTRY_FILE.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def sanitize_filename_token(text: str) -> str:
+    """
+    Neteja caràcters invàlids per a noms de fitxer a Windows/Linux.
+    """
+    if text is None:
+        return ""
+    s = str(text).strip()
+    s = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", s)
+    s = re.sub(r"\s+", "_", s)
+    s = s.strip(" .")
+    return s
+
+
+def build_renamed_filenames(
+    rows: list,
+    pattern: str = "{codi}",
+    prefix: str = "",
+) -> list:
+    """
+    Calcula el camp `nou_nom` per a cada fila de resultats del batch,
+    aplicant el patró escollit i resolent col·lisions (duplicats) amb sufixos `_2`, `_3`, etc.
+    """
+    clean_prefix = sanitize_filename_token(prefix)
+    used_names = {}
+    enriched = []
+
+    for r in rows:
+        row_copy = dict(r)
+        orig_file = str(row_copy.get("fitxer", "") or "")
+        orig_path = Path(orig_file)
+        ext = orig_path.suffix
+        orig_stem = sanitize_filename_token(orig_path.stem) or "document"
+        clean_code = sanitize_filename_token(row_copy.get("codi", ""))
+
+        if not clean_code:
+            base_stem = orig_stem
+        else:
+            if pattern == "{prefix}{codi}":
+                base_stem = f"{clean_prefix}{clean_code}"
+            elif pattern == "{codi}_{original}":
+                base_stem = f"{clean_code}_{orig_stem}"
+            else:
+                base_stem = clean_code
+
+        candidate = f"{base_stem}{ext}"
+        key = candidate.lower()
+
+        if key not in used_names:
+            used_names[key] = 1
+            final_name = candidate
+        else:
+            idx = used_names[key] + 1
+            while f"{base_stem}_{idx}{ext}".lower() in used_names:
+                idx += 1
+            used_names[key] = idx
+            final_name = f"{base_stem}_{idx}{ext}"
+            used_names[final_name.lower()] = 1
+
+        row_copy["nou_nom"] = final_name
+        enriched.append(row_copy)
+
+    return enriched
+
+
+def _build_export_index_csv_bytes(exported_items: list) -> bytes:
+    buf = io.StringIO()
+    fieldnames = [
+        "fitxer_original",
+        "nou_nom",
+        "codi",
+        "format",
+        "min_conf",
+        "avg_conf",
+        "status",
+        "timestamp",
+    ]
+    writer = csv.DictWriter(buf, fieldnames=fieldnames)
+    writer.writeheader()
+    ts = datetime.now().isoformat(timespec="seconds")
+    for item in exported_items:
+        writer.writerow({
+            "fitxer_original": item.get("fitxer", ""),
+            "nou_nom": item.get("nou_nom", ""),
+            "codi": item.get("codi", ""),
+            "format": item.get("format", ""),
+            "min_conf": item.get("min_conf", ""),
+            "avg_conf": item.get("avg_conf", ""),
+            "status": item.get("status", ""),
+            "timestamp": ts,
+        })
+    return buf.getvalue().encode("utf-8-sig")
+
+
+def build_batch_export_zip(source_dir: Path, rows: list) -> bytes:
+    """
+    Genera en memòria un fitxer .ZIP amb els documents seleccionats (`exportar=True`)
+    reanomenats segons `nou_nom`, més un fitxer `index_exportacio.csv`.
+    """
+    source_dir = Path(source_dir)
+    selected = [
+        r for r in rows
+        if bool(r.get("exportar", False)) and str(r.get("fitxer", "")).strip()
+    ]
+
+    mem_zip = io.BytesIO()
+    exported_items = []
+
+    with zipfile.ZipFile(mem_zip, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for r in selected:
+            src_path = source_dir / str(r["fitxer"])
+            if not src_path.exists() or not src_path.is_file():
+                continue
+            dst_name = str(r.get("nou_nom") or r["fitxer"])
+            zf.writestr(dst_name, src_path.read_bytes())
+            exported_items.append(r)
+
+        index_bytes = _build_export_index_csv_bytes(exported_items)
+        zf.writestr("index_exportacio.csv", index_bytes)
+
+    return mem_zip.getvalue()
+
+
+def export_batch_to_folder(source_dir: Path, target_dir: Path, rows: list) -> dict:
+    """
+    Copia els documents seleccionats (`exportar=True`) de `source_dir` a `target_dir`
+    amb el seu `nou_nom`, i desa `index_exportacio.csv` a la carpeta de destinació.
+    """
+    source_dir = Path(source_dir)
+    target_dir = Path(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    selected = [
+        r for r in rows
+        if bool(r.get("exportar", False)) and str(r.get("fitxer", "")).strip()
+    ]
+
+    copied_files = []
+    exported_items = []
+
+    for r in selected:
+        src_path = source_dir / str(r["fitxer"])
+        if not src_path.exists() or not src_path.is_file():
+            continue
+        dst_name = str(r.get("nou_nom") or r["fitxer"])
+        dst_path = target_dir / dst_name
+        shutil.copy2(src_path, dst_path)
+        copied_files.append(str(dst_path))
+        exported_items.append(r)
+
+    index_path = target_dir / "index_exportacio.csv"
+    index_path.write_bytes(_build_export_index_csv_bytes(exported_items))
+
+    return {
+        "copied_count": len(copied_files),
+        "target_dir": str(target_dir),
+        "files": copied_files,
+        "index_csv": str(index_path),
+    }

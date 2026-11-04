@@ -1,0 +1,166 @@
+{
+  "timestamp": "2026-11-04T11:17:59",
+  "device": "cuda",
+  "cuda": true,
+  "gpu": "NVIDIA RTX PRO 1000 Blackwell Generation Laptop GPU",
+  "num_samples": 104,
+  "alphabet": "0123456789",
+  "counts": {
+    "0": 20,
+    "1": 15,
+    "2": 10,
+    "3": 5,
+    "4": 10,
+    "5": 21,
+    "6": 5,
+    "7": 3,
+    "8": 8,
+    "9": 7
+  },
+  "epochs": 20,
+  "batch_size": 8,
+  "lr": 0.001,
+  "history": [
+    {
+      "epoch": 1,
+      "train_loss": 2.473602771759033,
+      "train_acc": 0.2261904761904762,
+      "val_loss": 2.268037223815918,
+      "val_acc": 0.2
+    },
+    {
+      "epoch": 2,
+      "train_loss": 1.6978187333969843,
+      "train_acc": 0.47619047619047616,
+      "val_loss": 2.3670976638793944,
+      "val_acc": 0.1
+    },
+    {
+      "epoch": 3,
+      "train_loss": 1.3073673418590002,
+      "train_acc": 0.5476190476190477,
+      "val_loss": 1.9686996936798096,
+      "val_acc": 0.4
+    },
+    {
+      "epoch": 4,
+      "train_loss": 0.950939587184361,
+      "train_acc": 0.7380952380952381,
+      "val_loss": 1.5339868068695068,
+      "val_acc": 0.5
+    },
+    {
+      "epoch": 5,
+      "train_loss": 0.6258418318771181,
+      "train_acc": 0.7619047619047619,
+      "val_loss": 1.3242514729499817,
+      "val_acc": 0.65
+    },
+    {
+      "epoch": 6,
+      "train_loss": 0.562585554662205,
+      "train_acc": 0.8333333333333334,
+      "val_loss": 1.2409149348735808,
+      "val_acc": 0.6
+    },
+    {
+      "epoch": 7,
+      "train_loss": 0.42086251292909893,
+      "train_acc": 0.9166666666666666,
+      "val_loss": 1.105834287405014,
+      "val_acc": 0.7
+    },
+    {
+      "epoch": 8,
+      "train_loss": 0.2627749650606087,
+      "train_acc": 0.9404761904761905,
+      "val_loss": 0.8520863592624665,
+      "val_acc": 0.8
+    },
+    {
+      "epoch": 9,
+      "train_loss": 0.1612872722603026,
+      "train_acc": 0.9761904761904762,
+      "val_loss": 0.7354563117027283,
+      "val_acc": 0.8
+    },
+    {
+      "epoch": 10,
+      "train_loss": 0.09294039365791139,
+      "train_acc": 1.0,
+      "val_loss": 0.8826471269130707,
+      "val_acc": 0.85
+    },
+    {
+      "epoch": 11,
+      "train_loss": 0.08010002154679526,
+      "train_acc": 0.9880952380952381,
+      "val_loss": 0.7131739586591721,
+      "val_acc": 0.8
+    },
+    {
+      "epoch": 12,
+      "train_loss": 0.05864169705836546,
+      "train_acc": 1.0,
+      "val_loss": 0.8092219360172749,
+      "val_acc": 0.75
+    },
+    {
+      "epoch": 13,
+      "train_loss": 0.03915606483462311,
+      "train_acc": 1.0,
+      "val_loss": 0.5934827901422978,
+      "val_acc": 0.8
+    },
+    {
+      "epoch": 14,
+      "train_loss": 0.0360225196040812,
+      "train_acc": 1.0,
+      "val_loss": 0.7438407942652703,
+      "val_acc": 0.75
+    },
+    {
+      "epoch": 15,
+      "train_loss": 0.02848248751390548,
+      "train_acc": 1.0,
+      "val_loss": 0.7418284960091114,
+      "val_acc": 0.75
+    },
+    {
+      "epoch": 16,
+      "train_loss": 0.05760959278614748,
+      "train_acc": 0.9880952380952381,
+      "val_loss": 0.7781393680721521,
+      "val_acc": 0.85
+    },
+    {
+      "epoch": 17,
+      "train_loss": 0.019874224217519873,
+      "train_acc": 1.0,
+      "val_loss": 0.8002009532414377,
+      "val_acc": 0.75
+    },
+    {
+      "epoch": 18,
+      "train_loss": 0.03831392792718751,
+      "train_acc": 0.9880952380952381,
+      "val_loss": 0.6992297880351543,
+      "val_acc": 0.85
+    },
+    {
+      "epoch": 19,
+      "train_loss": 0.022581549937881175,
+      "train_acc": 1.0,
+      "val_loss": 0.7609346158802509,
+      "val_acc": 0.8
+    },
+    {
+      "epoch": 20,
+      "train_loss": 0.020193730359010044,
+      "train_acc": 1.0,
+      "val_loss": 0.8263066075742245,
+      "val_acc": 0.8
+    }
+  ],
+  "model_path": "C:\\Ferran\\01_PROJECTES\\EVO_SKILL_BUILDER\\data\\projects\\contractos_cb_mix_20261103_133240\\models\\model_latest.pt"
+}
