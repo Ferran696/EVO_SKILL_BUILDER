@@ -19,6 +19,11 @@ from core.storage import (
     build_batch_export_zip,
     export_batch_to_folder,
 )
+from core.labels import (
+    apply_manual_review_update,
+    save_corrected_crops_for_training,
+    build_box_template_from_labels,
+)
 from core.utils import load_first_page_image, crop_relative
 from app import predict_document_code_from_path, load_trained_model_for_project, load_project_config
 
@@ -250,6 +255,75 @@ class RobustFeaturesTests(unittest.TestCase):
             self.assertTrue((dst_dir / "517932.pdf").exists())
             self.assertFalse((dst_dir / "517919.pdf").exists())
             self.assertTrue((dst_dir / "index_exportacio.csv").exists())
+
+    def test_apply_manual_review_update_and_active_learning_save(self):
+        results = [
+            {"exportar": False, "fitxer": "20.pdf", "codi": "517000", "status": "REVIEW"},
+            {"exportar": True, "fitxer": "18.pdf", "codi": "0529820", "status": "OK"},
+        ]
+        details = {
+            "20.pdf": {"code": "517000"},
+        }
+
+        updated = apply_manual_review_update(results, details, "20.pdf", "517919", mark_export=True)
+        self.assertTrue(updated)
+        self.assertEqual(results[0]["codi"], "517919")
+        self.assertEqual(results[0]["status"], "MANUAL_OK")
+        self.assertTrue(results[0]["exportar"])
+        self.assertEqual(details["20.pdf"]["code"], "517919")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pdir = Path(tmp)
+            config = {"project_id": "test_proj", "alphabet": "0123456789", "fixed_length": 3}
+            crops = [Image.new("L", (16, 24), 120) for _ in range(3)]
+            pos_details = [
+                {"pos": 1, "box": {"x0": 2, "y0": 4, "x1": 18, "y1": 28}},
+                {"pos": 2, "box": {"x0": 22, "y0": 4, "x1": 38, "y1": 28}},
+                {"pos": 3, "box": {"x0": 42, "y0": 4, "x1": 58, "y1": 28}},
+            ]
+            n_saved = save_corrected_crops_for_training(
+                pdir=pdir,
+                config=config,
+                source_doc="20.pdf",
+                truth_code="517",
+                char_crops=crops,
+                pos_details=pos_details,
+                roi={"x0": 0.7, "y0": 0.05, "x1": 0.95, "y1": 0.12},
+                alphabet="0123456789",
+            )
+            self.assertEqual(n_saved, 3)
+            self.assertEqual(len(list((pdir / "samples" / "5").glob("*.png"))), 1)
+            self.assertEqual(len(list((pdir / "samples" / "1").glob("*.png"))), 1)
+            self.assertEqual(len(list((pdir / "samples" / "7").glob("*.png"))), 1)
+            self.assertTrue((pdir / "labels.csv").exists())
+
+            # Verificar que les files desades compleixen l'esquema de build_box_template_from_labels
+            tpl = build_box_template_from_labels(pdir, fixed_length=3)
+            self.assertEqual(len(tpl), 3)
+
+    def test_predict_document_code_override_roi(self):
+        pdir = Path("data/projects/contractos_cb_mix_20261103_133240")
+        fpath = pdir / "uploads" / "19.pdf"
+        if not (pdir.exists() and fpath.exists() and (pdir / "models" / "model_latest.pt").exists()):
+            self.skipTest("Projecte contractos_cb_mix o 19.pdf no disponible.")
+
+        config = load_project_config(pdir)
+        model, alphabet, device, _ = load_trained_model_for_project(pdir)
+        # Usar primer la predicció normal per obtenir la ROI ancorada i després passar-la com override_roi
+        res_auto = predict_document_code_from_path(fpath, config, model, alphabet, device, use_router=True)
+        custom_roi = res_auto["roi"]
+
+        res_override = predict_document_code_from_path(
+            fpath,
+            config,
+            model,
+            alphabet,
+            device,
+            use_router=True,
+            override_roi=custom_roi,
+        )
+        self.assertEqual(res_override["roi"], custom_roi)
+        self.assertEqual(res_override["code"], "517932")
 
 
 if __name__ == "__main__":

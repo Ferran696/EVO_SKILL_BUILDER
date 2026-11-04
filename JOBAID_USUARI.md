@@ -44,19 +44,50 @@ No cal que toquis res complicat; només assegura't que tens marcat el següent:
 3. Fes clic al botó gran **`▶️ Processar batch`**.
 4. Espera uns segons mentre la barra de progrés arriba al 100%.
 
-### Pas 1.4 · Revisa la taula i corregeix si n'hi ha algun de dubtós
-Baixa a **4) Resultats batch, Reindexació i Exportació**. Veuràs una taula molt clara:
+### Pas 1.4 · Revisa la taula de resultats
+Baixa a **4) Resultats batch, Reindexació i Exportació**. Veuràs una taula molt clara amb el resultat de cada PDF:
 
 | Què veuràs a la taula | Què vol dir |
 | :--- | :--- |
-| **`Exportar` (Casella ✔)** | Si està marcada, aquest document s'inclourà a la descàrrega final amb el nom nou. |
+| **`Exportar` (Casella ✔)** | Si està marcada, aquest document s'inclourà a la descàrrega final amb el nom nou. Es marca sola per a tots els documents `OK` o corregits manualment (`MANUAL_OK`). |
 | **`Fitxer original`** | El nom que tenia el document quan l'has pujat (ex: `18.pdf`). |
-| **`Codi (editable)`** | El número que ha llegit el programa (ex: `0529820`). **Si algun número no és correcte, fes doble clic a sobre de la casella, escriu el número bo i prem `Enter`!** |
+| **`Codi (editable)`** | El número que ha llegit el programa (ex: `0529820`). **Si fas doble clic a sobre de la casella, pots escriure el número bo i prémer `Enter`**: el document passarà sol a `MANUAL_OK` i es marcarà per exportar! |
 | **`Nou nom fitxer`** | Com es dirà el fitxer quan el descarreguis (ex: `0529820.pdf`). Si hi ha dos documents amb el mateix número, el segon es posarà sol com `0529820_2.pdf` perquè mai es perdi cap fitxer. |
-| **`Status`** | **`OK`** = el programa n'està molt segur. **`REVIEW`** = el programa té algun dubte i et recomana mirar-lo un segon. |
+| **`Status`** | 🟢 **`OK`** = lectura automàtica fiable.<br>🟠 **`REVIEW`** / 🔴 **`ERROR`** = el programa té algun dubte i et demana que el miris un segon.<br>🔵 **`MANUAL_OK`** = l'has revisat o corregit tu mateix i ja està llest per exportar. |
 
-> 💡 **Truc per comprovar un document dubtós (`REVIEW`):**
-> Baixa a l'apartat **5) Detall visual** (a sota del tot) i tria el fitxer al desplegable **Fitxer per inspeccionar**. Veuràs el retall del número en gran. Si veus que un dígit balla, puja a la taula, fes doble clic a la columna **`Codi (editable)`**, corregeix-lo i marca la casella **`Exportar`**.
+---
+
+### Pas 1.4.B · 🛠️ Estació de Revisió Ràpida per als casos `REVIEW` (sense sortir de la pantalla)
+
+Si a la taula t'ha sortit algun document en estat **`REVIEW`** o **`ERROR`**, **no cal que obris el PDF fora del programa ni que vagis pujant i baixant per la pàgina**. Baixa directament al bloc **5) Estació de Revisió Ràpida (`REVIEW`) i Detall Visual**:
+
+#### 1. Com funciona el visor de revisió?
+- **Cua intel·ligent (`⚠️ Només pendents`):** El programa ja et filtra automàticament només els documents que tenen dubtes (`REVIEW` / `ERROR`). Quan en valides un, **salta sol al següent pendent** fins que el comptador arriba a zero (`🎉 Tots els documents estan validats`).
+- **Navegació fàcil:** Pots moure't amb els botons **`⬅️ Anterior`** i **`➡️ Següent`** o triar qualsevol document al desplegable.
+- **Tot a la vista (columna esquerra `👁️ Visor`):**
+  1. Veus el **retall de la ROI** que ha llegit la IA.
+  2. Veus **cada dígit separat** amb el tant per cent de seguretat (ex: `#1 · 5 (99%)`).
+  3. Tens obert automàticament el desplegable **`📄 Veure capçalera del document original (amb ROI marcada)`**, on veus la part de dalt del full sencer amb el requadre vermell perquè puguis llegir el número real amb els teus propis ulls.
+
+#### 2. Tres maneres d'arreglar un document `REVIEW` en 2 segons (columna dreta `✏️ Correcció i Validació`):
+
+* **CAS A · El número es llegeix bé a la imatge, però el programa s'ha equivocat en alguna xifra:**
+  1. Mira la imatge de l'esquerra per veure quin és el número real.
+  2. A la dreta, escriu el número correcte dins la casella **`Codi del document`**.
+  3. Prem el botó blau **`✅ Validar codi i marcar per exportar`**.
+  4. *Què passa?* El document canvia a **`MANUAL_OK`**, se li activa la casella **`Exportar`**, se li calcula el nou nom de fitxer i la pantalla passa automàticament al següent document pendent!
+
+* **CAS B · Vols validar el número i, de pas, fer que el programa n'aprengui (`🧠 Active Learning`):**
+  1. Si veus que els quadradets dels dígits estan ben tallats (un número a cada quadradet) però el programa ha confós, per exemple, un `8` amb un `3`:
+  2. Escriu el codi correcte a **`Codi del document`**.
+  3. Prem **`🧠 Validar + Guardar dígits per entrenar (Active Learning)`**.
+  4. *Què passa?* Fa el mateix que el botó de validar, però a més **guarda els retalls d'aquests números a la memòria d'entrenament** perquè la pròxima vegada que entrenis el model ja no torni a dubtar.
+
+* **CAS C · Han escanejat el paper tan tort o mogut que el requadre vermell no ha agafat el número (`📐 Document rebel`):**
+  1. Just a sota, obre el desplegable **`📐 Reajustar ROI d'aquest document rebel i re-llegir amb la CNN`**.
+  2. Mou les barres (`x0 · esquerra`, `y0 · dalt`, `x1 · dreta`, `y1 · baix`) mentre mires la **Previsualització en viu** de la dreta fins que el número complet quedi ben centrat dins del retall.
+  3. *(Opcional)* Si tots els documents d'aquest tipus vénen igual de moguts, marca `Guardar també aquesta ROI com a plantilla per al format`.
+  4. Prem **`🔄 Re-llegir aquest document amb la nova ROI`**. El programa tornarà a llegir només aquest PDF en menys d'un segon i n'actualitzarà el codi!
 
 ### Pas 1.5 · Descarrega els documents ja reanomenats ("Ready to Work")
 1. Si vols canviar el format del nom (per exemple, posar `ALB_0529820.pdf` o mantenir el nom antic al final `0529820_18.pdf`), tria-ho al desplegable **Patró de nou nom**.
@@ -116,11 +147,16 @@ Aquí li diem al programa quin número és cada imatge perquè aprengui:
 ### 1. *"He fet un canvi però a la pantalla continua sortint el mateix d'abans"*
 - Prem la tecla **`F5`** (o recarrega la pàgina del navegador) i torna a prémer el botó **`▶️ Processar batch`**.
 
-### 2. *"En un document el programa s'ha deixat un número o s'ha equivocat en una xifra"*
-- No cal que tornis a entrenar res! A la mateixa taula de **`07 · Run batch`**, fes **doble clic a la cel·la `Codi (editable)`** d'aquella fila, escriu el número correcte i prem `Enter`. El `Nou nom fitxer` s'actualitzarà a l'instant.
+### 2. *"En un document el programa s'ha deixat un número o ha sortit com a `REVIEW`"*
+- Tens dues opcions igual de ràpides ( sense re-entrenar res):
+  1. **Des de l'Estació de Revisió (secció 5 de `07 · Run batch`):** Mira la capçalera del document a l'esquerra, escriu el codi bo a la dreta i prem **`✅ Validar codi i marcar per exportar`** (o **`🧠 Validar + Guardar dígits per entrenar`** si vols que el model aprengui d'aquesta correcció).
+  2. **Directament a la taula (secció 4):** Fes **doble clic a la cel·la `Codi (editable)`**, escriu el número correcte i prem `Enter`. L'estat passarà sol a `MANUAL_OK`, es marcarà la casella `Exportar` i el `Nou nom fitxer` s'actualitzarà a l'instant.
 
-### 3. *"A la pantalla 04 d'etiquetatge no es veu el número sencer dins el requadre"*
+### 3. *"En un PDF del batch el requadre vermell ha caigut en blanc perquè l'escaneig està molt desplaçat"*
+- Dins de la mateixa pantalla **`07 · Run batch`** (secció 5), obre el desplegable **`📐 Reajustar ROI d'aquest document rebel i re-llegir amb la CNN`**, mou les barres fins a centrar el número a la previsualització i prem **`🔄 Re-llegir aquest document amb la nova ROI`**.
+
+### 4. *"A la pantalla 04 d'etiquetatge no es veu el número sencer dins el requadre"*
 - Això passa si la finestra base és massa estreta. Ves un moment a **`03 · ROI bàsica`**, selecciona aquest document, obre una mica més els marges amb els sliders (`x0`, `x1`, `y0`, `y1`) i prem **`💾 Guardar ROI`**.
 
-### 4. *"Què passa si dos PDFs del mateix lot tenen exactament el mateix codi?"*
+### 5. *"Què passa si dos PDFs del mateix lot tenen exactament el mateix codi?"*
 - Tranquil, **mai s'esborrarà ni es trepitjarà cap document**. El primer es guardarà com `0529820.pdf` i el segon com `0529820_2.pdf` (o pots triar el patró `{codi}_{original}.ext` perquè es diguin `0529820_18.pdf` i `0529820_19.pdf`).

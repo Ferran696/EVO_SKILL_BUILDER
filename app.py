@@ -69,7 +69,14 @@ from core.segmentation import (
     deskew_image,
 )
 from core.vlm import get_char_boxes_from_vlm
-from core.labels import append_label_rows, build_box_template_from_labels
+import core.labels as _labels_mod
+importlib.reload(_labels_mod)
+from core.labels import (
+    append_label_rows,
+    build_box_template_from_labels,
+    apply_manual_review_update,
+    save_corrected_crops_for_training,
+)
 
 st.set_page_config(
     page_title="EVO Skill Builder",
@@ -395,12 +402,14 @@ def predict_document_code_from_path(
     segmentation_method: str = "connected_components",
     use_anchor: bool = True,
     use_deskew: bool = False,
+    override_roi: dict = None,
 ) -> dict:
     """
     Prediu el codi complet d'un document nou.
     Suporta dos modes:
     1) Multi-format router (classificació dinàmica de plantilla + segmentació per components connectats / histograma + ancoratge)
     2) Template fixa (legacy: document -> ROI estàtica -> caixes plantilla -> CNN)
+    Si es passa `override_roi`, s'utilitza aquesta ROI manual per a aquest document concret.
     """
     img = load_first_page_image(path, dpi=150)
     w, h = img.size
@@ -413,9 +422,9 @@ def predict_document_code_from_path(
         format_result = classify_document_format(
             img,
             custom_rois=config.get("custom_rois"),
-            auto_anchor=use_anchor,
+            auto_anchor=(use_anchor and override_roi is None),
         )
-        roi = format_result["roi"]
+        roi = override_roi if override_roi is not None else format_result["roi"]
         expected_len = format_result["expected_length"]
         filter_dots = format_result["filter_dots"]
         crop_raw = crop_relative(img, roi)
@@ -466,6 +475,7 @@ def predict_document_code_from_path(
             "crop": crop_raw,
             "char_crops": char_crops,
             "fixed_length": expected_len,
+            "roi": roi,
             "format_id": format_result["format_id"],
             "format_name": format_result["format_info"]["name"],
             "format_confidence": format_result["confidence"],
@@ -476,7 +486,7 @@ def predict_document_code_from_path(
         }
 
     # Legacy template mode
-    roi = config.get("roi")
+    roi = override_roi if override_roi is not None else config.get("roi")
     fixed_length = int(config.get("fixed_length", 0) or 0)
 
     if not roi:
@@ -531,6 +541,7 @@ def predict_document_code_from_path(
         "crop": crop,
         "char_crops": char_crops,
         "fixed_length": fixed_length,
+        "roi": roi,
         "format_id": "legacy_fixed_template",
         "format_name": "Plantilla fixa estàndard",
         "format_confidence": 1.0,
@@ -1691,7 +1702,7 @@ elif page == "07 · Run batch":
                 st.write("")
                 if st.button("☑️ Només OK", use_container_width=True):
                     for r in st.session_state["run_batch_results"]:
-                        r["exportar"] = (r.get("status") == "OK")
+                        r["exportar"] = (r.get("status") in ("OK", "MANUAL_OK"))
                     st.session_state["run_batch_editor_rev"] = st.session_state.get("run_batch_editor_rev", 0) + 1
                     st.rerun()
 
@@ -1757,6 +1768,10 @@ elif page == "07 · Run batch":
                     new_code = str(rec.get("codi", "") or "").strip()
                     if results[idx].get("codi") != new_code:
                         code_changed = True
+                        if new_code:
+                            new_exp = True
+                            if results[idx].get("status") in ("REVIEW", "ERROR"):
+                                results[idx]["status"] = "MANUAL_OK"
                     results[idx]["exportar"] = new_exp
                     results[idx]["codi"] = new_code
                     fname = results[idx].get("fitxer")
@@ -1833,37 +1848,339 @@ elif page == "07 · Run batch":
                         except Exception as e:
                             st.error(f"Error exportant a carpeta: {e}")
 
-            st.markdown("### 5) Detall visual")
+            st.markdown("---")
+            st.markdown("### 5) Estació de Revisió Ràpida (`REVIEW`) i Detall Visual")
+            st.caption("Inspecciona, corregeix amb un clic, reajusta la ROI de documents rebels o guarda dígits corregits per entrenar.")
 
-            ok_files = [r["fitxer"] for r in results if r.get("fitxer") in details]
+            flash_msg = st.session_state.pop("batch_review_flash", None)
+            if flash_msg:
+                st.success(flash_msg)
 
-            if ok_files:
-                selected_file = st.selectbox("Fitxer per inspeccionar", ok_files)
-                pred = details[selected_file]
+            pending_rows = [r for r in results if r.get("status") in ("REVIEW", "ERROR")]
+            n_pending = len(pending_rows)
+            n_manual_ok = sum(1 for r in results if r.get("status") == "MANUAL_OK")
 
-                st.markdown(f"#### `{selected_file}` → `{pred['code']}`")
-                if "format_name" in pred:
-                    st.info(f"**Format detectat:** {pred['format_name']} (confiança: {pred.get('format_confidence', 1.0)*100:.1f}%)")
-                st.caption(f"min_conf={pred['min_conf']:.3f} · avg_conf={pred['avg_conf']:.3f}")
+            if n_pending > 0:
+                st.warning(
+                    f"⚠️ Hi ha **{n_pending} document(s) pendent(s) de revisió** (`REVIEW` / `ERROR`). "
+                    + (f"({n_manual_ok} ja validats manualment)" if n_manual_ok else "")
+                )
+            else:
+                st.success(
+                    f"🎉 Tots els documents estan validats (`OK` / `MANUAL_OK`)"
+                    + (f" · {n_manual_ok} corregits manualment." if n_manual_ok else ".")
+                )
 
-                c_left, c_right = st.columns([1.0, 1.2], gap="large")
+            rev_f1, rev_f2 = st.columns([1.4, 2.0])
+            with rev_f1:
+                filter_mode = st.radio(
+                    "🔍 Mostrar documents",
+                    [
+                        f"⚠️ Només pendents ({n_pending})",
+                        f"📋 Tots els documents ({len(results)})",
+                    ],
+                    index=0 if n_pending > 0 else 1,
+                    horizontal=True,
+                    key="batch_review_filter_radio",
+                )
+                only_pending = filter_mode.startswith("⚠️")
 
-                with c_left:
-                    st.image(pred["crop"], caption="ROI processada", use_container_width=False)
+            filtered_rows = pending_rows if only_pending else results
+            filtered_files = [r["fitxer"] for r in filtered_rows if r.get("fitxer")]
 
-                with c_right:
-                    rows = []
-                    for d in pred["pos_details"]:
-                        rows.append({
-                            "pos": d["pos"],
-                            "pred": d["pred"],
-                            "confidence": round(d["confidence"], 4),
-                        })
-                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            if not filtered_files:
+                st.info("✅ No queda cap document pendent a la cua `REVIEW`. Canvia a `📋 Tots els documents` si vols inspeccionar la resta.")
+            else:
+                cur_sel = st.session_state.get("batch_review_selected_file")
+                if cur_sel not in filtered_files:
+                    cur_sel = filtered_files[0]
+                    st.session_state["batch_review_selected_file"] = cur_sel
 
-                st.markdown("#### Crops per posició")
-                cols = st.columns(min(max(1, len(pred["char_crops"])), 10))
-                for i, ch_img in enumerate(pred["char_crops"]):
-                    detail = pred["pos_details"][i]
-                    with cols[i % min(max(1, len(pred["char_crops"])), 10)]:
-                        st.image(ch_img, caption=f"{detail['pos']} · {detail['pred']} · {detail['confidence']*100:.0f}%", use_container_width=True)
+                cur_idx = filtered_files.index(cur_sel)
+
+                nav_c1, nav_c2, nav_c3 = st.columns([0.6, 2.2, 0.6])
+                with nav_c1:
+                    st.write("")
+                    if st.button("⬅️ Anterior", disabled=(cur_idx <= 0), use_container_width=True, key="btn_rev_prev"):
+                        st.session_state["batch_review_selected_file"] = filtered_files[max(0, cur_idx - 1)]
+                        st.rerun()
+                with nav_c2:
+                    def _fmt_doc_option(fname: str) -> str:
+                        r_match = next((x for x in results if x.get("fitxer") == fname), {})
+                        st_tag = r_match.get("status", "")
+                        icon = "⚠️" if st_tag in ("REVIEW", "ERROR") else ("🛠️" if st_tag == "MANUAL_OK" else "✅")
+                        return f"{icon} {fname}  →  {r_match.get('codi') or '(buit)'}  [{st_tag}]"
+
+                    selected_file = st.selectbox(
+                        f"Document ({cur_idx + 1}/{len(filtered_files)})",
+                        filtered_files,
+                        index=cur_idx,
+                        format_func=_fmt_doc_option,
+                        key="batch_review_selectbox_widget",
+                    )
+                    if selected_file != cur_sel:
+                        st.session_state["batch_review_selected_file"] = selected_file
+                        st.rerun()
+                with nav_c3:
+                    st.write("")
+                    if st.button("➡️ Següent", disabled=(cur_idx >= len(filtered_files) - 1), use_container_width=True, key="btn_rev_next"):
+                        st.session_state["batch_review_selected_file"] = filtered_files[min(len(filtered_files) - 1, cur_idx + 1)]
+                        st.rerun()
+
+                row_obj = next((r for r in results if r.get("fitxer") == selected_file), {})
+                pred = details.get(selected_file, {})
+                row_status = row_obj.get("status", "REVIEW")
+                doc_path = Path(run_batch_dir) / selected_file if run_batch_dir else None
+                has_doc_file = bool(doc_path and doc_path.exists())
+
+                c_vis, c_edit = st.columns([1.25, 1.0], gap="large")
+
+                with c_vis:
+                    st.markdown(f"#### 👁️ Visor: `{selected_file}`")
+                    if pred.get("crop") is not None:
+                        st.image(pred["crop"], caption="ROI processada per la CNN", use_container_width=False)
+                    else:
+                        st.warning("No hi ha imatge de ROI disponible per a aquest document.")
+
+                    char_crops_list = pred.get("char_crops", [])
+                    pos_details_list = pred.get("pos_details", [])
+                    if char_crops_list:
+                        st.markdown("**Crops segmentats per posició:**")
+                        cols = st.columns(min(max(1, len(char_crops_list)), 10))
+                        for i, ch_img in enumerate(char_crops_list):
+                            detail = pos_details_list[i] if i < len(pos_details_list) else {"pos": i + 1, "pred": "?", "confidence": 0.0}
+                            with cols[i % min(max(1, len(char_crops_list)), 10)]:
+                                st.image(
+                                    ch_img,
+                                    caption=f"#{detail['pos']} · `{detail['pred']}` ({detail['confidence']*100:.0f}%)",
+                                    use_container_width=True,
+                                )
+                    else:
+                        st.info("No s'ha extret cap caràcter d'aquesta ROI.")
+
+                    if has_doc_file:
+                        expand_header = (row_status in ("REVIEW", "ERROR") or not char_crops_list)
+                        with st.expander("📄 Veure capçalera del document original (amb ROI marcada)", expanded=expand_header):
+                            try:
+                                full_img = load_first_page_image(doc_path, dpi=130)
+                                used_roi = pred.get("roi") or config.get("roi") or {"x0": 0.5, "y0": 0.0, "x1": 0.98, "y1": 0.25}
+                                overlay_img = draw_roi_overlay(full_img, used_roi)
+                                header_y1 = min(1.0, max(0.32, float(used_roi.get("y1", 0.25)) + 0.10))
+                                header_crop = crop_relative(overlay_img, {"x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": header_y1})
+                                st.image(header_crop, caption="Capçalera del document (rectangle vermell = ROI actual)", use_container_width=True)
+                            except Exception as e:
+                                st.warning(f"No s'ha pogut mostrar la capçalera: {e}")
+
+                with c_edit:
+                    st.markdown("#### ✏️ Correcció i Validació")
+                    st_badge = {
+                        "OK": "🟢 **OK** (Automàtic)",
+                        "MANUAL_OK": "🔵 **MANUAL_OK** (Validat manualment)",
+                        "REVIEW": "🟠 **REVIEW** (Pendent de revisar)",
+                        "ERROR": "🔴 **ERROR**",
+                    }.get(row_status, row_status)
+                    st.markdown(f"**Estat actual:** {st_badge}")
+                    if "format_name" in pred:
+                        st.caption(
+                            f"Format: **{pred['format_name']}** · "
+                            f"min_conf=`{pred.get('min_conf', 0.0):.3f}` · avg_conf=`{pred.get('avg_conf', 0.0):.3f}`"
+                        )
+                    if row_obj.get("error"):
+                        st.error(f"Detall error: {row_obj['error']}")
+
+                    manual_code_val = st.text_input(
+                        "Codi del document",
+                        value=str(row_obj.get("codi", "") or ""),
+                        placeholder="Escriu o corregeix el codi aquí...",
+                        key=f"manual_code_input_{selected_file}_{editor_rev}",
+                    )
+                    clean_manual_code = manual_code_val.strip()
+
+                    def _advance_to_next_pending(current_fname: str):
+                        remaining = [
+                            r["fitxer"]
+                            for r in st.session_state.get("run_batch_results", [])
+                            if r.get("status") in ("REVIEW", "ERROR") and r.get("fitxer") != current_fname
+                        ]
+                        if remaining:
+                            st.session_state["batch_review_selected_file"] = remaining[0]
+                        elif cur_idx + 1 < len(filtered_files):
+                            st.session_state["batch_review_selected_file"] = filtered_files[cur_idx + 1]
+
+                    if st.button(
+                        "✅ Validar codi i marcar per exportar",
+                        type="primary",
+                        disabled=(not clean_manual_code),
+                        use_container_width=True,
+                        key=f"btn_validate_manual_{selected_file}",
+                    ):
+                        apply_manual_review_update(
+                            results=st.session_state["run_batch_results"],
+                            details=st.session_state["run_batch_details"],
+                            filename=selected_file,
+                            new_code=clean_manual_code,
+                            mark_export=True,
+                        )
+                        st.session_state["run_batch_editor_rev"] = editor_rev + 1
+                        st.session_state["batch_review_flash"] = (
+                            f"✅ Document `{selected_file}` validat amb el codi `{clean_manual_code}` (MANUAL_OK i marcat per exportar)."
+                        )
+                        _advance_to_next_pending(selected_file)
+                        st.rerun()
+
+                    can_save_samples = (
+                        len(char_crops_list) > 0
+                        and len(clean_manual_code) == len(char_crops_list)
+                        and all(c.upper() in alphabet for c in clean_manual_code)
+                    )
+                    if st.button(
+                        "🧠 Validar + Guardar dígits per entrenar (Active Learning)",
+                        disabled=(not can_save_samples),
+                        use_container_width=True,
+                        help=(
+                            "Valida el codi per exportar i alhora guarda els retalls d'aquests dígits a samples/ i labels.csv "
+                            "perquè el model aprengui en el pròxim entrenament."
+                        ),
+                        key=f"btn_validate_and_train_{selected_file}",
+                    ):
+                        try:
+                            n_saved = save_corrected_crops_for_training(
+                                pdir=pdir,
+                                config=config,
+                                source_doc=selected_file,
+                                truth_code=clean_manual_code,
+                                char_crops=char_crops_list,
+                                pos_details=pos_details_list,
+                                roi=pred.get("roi") or config.get("roi"),
+                                alphabet=alphabet,
+                            )
+                            apply_manual_review_update(
+                                results=st.session_state["run_batch_results"],
+                                details=st.session_state["run_batch_details"],
+                                filename=selected_file,
+                                new_code=clean_manual_code,
+                                mark_export=True,
+                            )
+                            st.session_state["run_batch_editor_rev"] = editor_rev + 1
+                            st.session_state["batch_review_flash"] = (
+                                f"🧠 Validat `{selected_file}` → `{clean_manual_code}` i guardats **{n_saved} dígits** a `samples/` per entrenar!"
+                            )
+                            _advance_to_next_pending(selected_file)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"No s'han pogut guardar les mostres: {e}")
+
+                    if char_crops_list and len(clean_manual_code) != len(char_crops_list):
+                        st.caption(
+                            f"ℹ️ Per guardar dígits d'entrenament cal que la longitud del codi ({len(clean_manual_code)}) "
+                            f"coincideixi amb els crops detectats ({len(char_crops_list)})."
+                        )
+
+                    if pos_details_list:
+                        with st.expander("📊 Detall de confiança per dígit", expanded=False):
+                            rows_conf = [
+                                {
+                                    "pos": d["pos"],
+                                    "pred": d["pred"],
+                                    "confidence": round(d["confidence"], 4),
+                                }
+                                for d in pos_details_list
+                            ]
+                            st.dataframe(pd.DataFrame(rows_conf), use_container_width=True, hide_index=True)
+
+                if has_doc_file:
+                    with st.expander("📐 Reajustar ROI d'aquest document rebel i re-llegir amb la CNN", expanded=False):
+                        st.caption(
+                            "Si aquest PDF s'ha escanejat tan desplaçat que la ROI no ha agafat bé el número, "
+                            "ajusta les coordenades aquí i prem **Re-llegir**."
+                        )
+                        base_doc_roi = pred.get("roi") or config.get("roi") or {"x0": 0.75, "y0": 0.05, "x1": 0.96, "y1": 0.14}
+                        r_c1, r_c2 = st.columns([1.0, 1.2], gap="large")
+                        with r_c1:
+                            rx0 = st.slider(
+                                "x0 · esquerra", 0.0, 1.0, float(base_doc_roi.get("x0", 0.75)), 0.005,
+                                key=f"rev_roi_x0_{selected_file}",
+                            )
+                            ry0 = st.slider(
+                                "y0 · dalt", 0.0, 1.0, float(base_doc_roi.get("y0", 0.05)), 0.005,
+                                key=f"rev_roi_y0_{selected_file}",
+                            )
+                            rx1 = st.slider(
+                                "x1 · dreta", 0.0, 1.0, float(base_doc_roi.get("x1", 0.96)), 0.005,
+                                key=f"rev_roi_x1_{selected_file}",
+                            )
+                            ry1 = st.slider(
+                                "y1 · baix", 0.0, 1.0, float(base_doc_roi.get("y1", 0.14)), 0.005,
+                                key=f"rev_roi_y1_{selected_file}",
+                            )
+                            sx0, sx1 = sorted([rx0, rx1])
+                            sy0, sy1 = sorted([ry0, ry1])
+                            custom_doc_roi = {"x0": sx0, "y0": sy0, "x1": sx1, "y1": sy1}
+
+                            save_as_format_default = st.checkbox(
+                                "Guardar també aquesta ROI com a plantilla per al format",
+                                value=False,
+                                key=f"rev_roi_save_fmt_{selected_file}",
+                            )
+
+                            if st.button(
+                                "🔄 Re-llegir aquest document amb la nova ROI",
+                                type="primary",
+                                use_container_width=True,
+                                key=f"btn_repredict_roi_{selected_file}",
+                            ):
+                                try:
+                                    new_pred = predict_document_code_from_path(
+                                        path=doc_path,
+                                        config=config,
+                                        model=model,
+                                        alphabet=alphabet,
+                                        device=device,
+                                        box_template=box_template,
+                                        use_auto_trim=use_auto_trim,
+                                        trim_threshold=trim_threshold,
+                                        trim_pad=trim_pad,
+                                        use_router=use_router,
+                                        segmentation_method=segmentation_method,
+                                        use_anchor=False,
+                                        use_deskew=use_deskew,
+                                        override_roi=custom_doc_roi,
+                                    )
+                                    new_status = "OK" if (
+                                        new_pred["min_conf"] >= min_conf_threshold
+                                        and new_pred["avg_conf"] >= avg_conf_threshold
+                                    ) else "REVIEW"
+
+                                    st.session_state["run_batch_details"][selected_file] = new_pred
+                                    for r in st.session_state["run_batch_results"]:
+                                        if r.get("fitxer") == selected_file:
+                                            r["codi"] = new_pred["code"]
+                                            r["format"] = new_pred.get("format_name", "N/A")
+                                            r["min_conf"] = round(new_pred["min_conf"], 4)
+                                            r["avg_conf"] = round(new_pred["avg_conf"], 4)
+                                            r["status"] = new_status
+                                            r["exportar"] = (new_status == "OK" and bool(new_pred["code"]))
+                                            r.pop("error", None)
+
+                                    if save_as_format_default and new_pred.get("format_id"):
+                                        if "custom_rois" not in config or not isinstance(config["custom_rois"], dict):
+                                            config["custom_rois"] = {}
+                                        config["custom_rois"][new_pred["format_id"]] = custom_doc_roi
+                                        save_project_config(pdir, config)
+
+                                    st.session_state["run_batch_editor_rev"] = editor_rev + 1
+                                    st.session_state["batch_review_flash"] = (
+                                        f"🔄 Re-llegit `{selected_file}` amb nova ROI → Codi detectat: `{new_pred['code']}` "
+                                        f"(min_conf={new_pred['min_conf']:.2f}, estat={new_status})."
+                                    )
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error en re-llegir el document: {e}")
+
+                        with r_c2:
+                            try:
+                                preview_page = load_first_page_image(doc_path, dpi=130)
+                                preview_crop = crop_relative(preview_page, custom_doc_roi)
+                                st.image(preview_crop, caption="Previsualització en viu del nou retall ROI", use_container_width=False)
+                            except Exception as e:
+                                st.warning(f"No es pot previsualitzar el retall: {e}")

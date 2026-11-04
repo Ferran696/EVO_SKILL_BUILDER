@@ -1,8 +1,12 @@
 import csv
+import datetime
+import re
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+from core.utils import slot_ink_ratio
 
 
 LABELS_CSV_FIELDS = [
@@ -108,3 +112,121 @@ def build_box_template_from_labels(pdir: Path, fixed_length: int) -> list:
         })
 
     return template
+
+
+def apply_manual_review_update(
+    results: list[dict],
+    details: dict,
+    filename: str,
+    new_code: str,
+    mark_export: bool = True,
+) -> bool:
+    """
+    Actualitza el codi d'un document del batch (p.ex. un cas REVIEW o ERROR),
+    canvia el seu estat a MANUAL_OK i el marca per exportar.
+    """
+    clean_code = str(new_code or "").strip()
+    updated = False
+
+    for row in results:
+        if row.get("fitxer") == filename:
+            row["codi"] = clean_code
+            if clean_code:
+                row["status"] = "MANUAL_OK"
+                row["exportar"] = bool(mark_export)
+            else:
+                row["exportar"] = False
+            updated = True
+
+    if filename in details and isinstance(details[filename], dict):
+        details[filename]["code"] = clean_code
+
+    return updated
+
+
+def save_corrected_crops_for_training(
+    pdir: Path,
+    config: dict,
+    source_doc: str,
+    truth_code: str,
+    char_crops: list,
+    pos_details: list = None,
+    roi: dict = None,
+    alphabet: str = "0123456789",
+) -> int:
+    """
+    Active Learning: Desa els retalls de caràcters (char_crops) d'un document revisat
+    dins de samples/<classe>/ i afegeix les files corresponents a labels.csv.
+    """
+    clean_alphabet = str(alphabet or config.get("alphabet", "0123456789"))
+    truth = "".join([c for c in str(truth_code or "").strip().upper() if c in clean_alphabet])
+
+    if not char_crops:
+        raise ValueError("Aquest document no té crops de caràcters segmentats per guardar.")
+
+    if len(truth) != len(char_crops):
+        raise ValueError(
+            f"El codi '{truth}' té {len(truth)} caràcters vàlids, però s'han detectat "
+            f"{len(char_crops)} crops. Ajusta la ROI o el codi perquè coincideixin."
+        )
+
+    pdir = Path(pdir)
+    samples_dir = pdir / "samples"
+    samples_dir.mkdir(parents=True, exist_ok=True)
+    labels_csv = pdir / "labels.csv"
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_stem = re.sub(r"[^A-Za-z0-9_\-]+", "_", Path(source_doc).stem)[:80]
+    roi = roi or config.get("roi") or {"x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0}
+    fixed_length = int(config.get("fixed_length", 0) or 0)
+
+    saved_rows = []
+    saved_count = 0
+
+    for idx, (crop_img, label_ch) in enumerate(zip(char_crops, truth), start=1):
+        class_dir = samples_dir / label_ch
+        class_dir.mkdir(parents=True, exist_ok=True)
+        out_name = f"{safe_stem}_{ts}_review_pos{idx:02d}_{label_ch}.png"
+        out_path = class_dir / out_name
+        crop_img.save(out_path)
+        saved_count += 1
+
+        box = {}
+        if pos_details and (idx - 1) < len(pos_details):
+            box = pos_details[idx - 1].get("box", {}) or {}
+
+        w_c, h_c = crop_img.size
+        bx0 = int(box.get("x0", 0))
+        by0 = int(box.get("y0", 0))
+        bx1 = int(box.get("x1", max(bx0 + 1, w_c)))
+        by1 = int(box.get("y1", max(by0 + 1, h_c)))
+        if bx1 <= bx0:
+            bx1 = bx0 + max(1, w_c)
+        if by1 <= by0:
+            by1 = by0 + max(1, h_c)
+
+        if fixed_length <= 0 or idx <= fixed_length:
+            saved_rows.append({
+                "timestamp": ts,
+                "project_id": config.get("project_id", pdir.name),
+                "source_doc": source_doc,
+                "truth": truth,
+                "pos": idx,
+                "label": label_ch,
+                "image_path": str(out_path),
+                "mode": "batch_review",
+                "ink_ratio": slot_ink_ratio(crop_img, threshold=200),
+                "box_x0": bx0,
+                "box_y0": by0,
+                "box_x1": bx1,
+                "box_y1": by1,
+                "roi_x0": roi.get("x0", 0.0),
+                "roi_y0": roi.get("y0", 0.0),
+                "roi_x1": roi.get("x1", 1.0),
+                "roi_y1": roi.get("y1", 1.0),
+            })
+
+    if saved_rows:
+        append_label_rows(labels_csv, saved_rows)
+
+    return saved_count
