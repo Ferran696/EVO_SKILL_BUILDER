@@ -95,6 +95,14 @@ Si a la taula t'ha sortit algun document en estat **`REVIEW`** o **`ERROR`**, **
    - **Opció A (Més fàcil):** Prem el botó **`📦 Descarregar ZIP reanomenat`**. Se't baixarà un fitxer `.zip` amb tots els PDFs ja canviats de nom i un Excel (`index_exportacio.csv`) amb el resum.
    - **Opció B (Directe a una carpeta de l'ordinador):** Prem **`📁 Exportar a carpeta local`**, comprova o enganxa la ruta de la carpeta on els vols i fes clic a **`💾 Copiar fitxers reanomenats`**.
 
+### Pas 1.6 · 🧹 Començar un nou lot de documents (Reset en 1 clic)
+Un cop hagis descarregat el `.ZIP` o copiat els fitxers a la teva carpeta i vulguis processar una altra remesa de PDFs:
+1. Prem el botó **`🧹 Següent Batch (Reset)`** (el trobaràs tant al costat dels botons d'exportar com a dalt al costat de `▶️ Processar batch`).
+2. **Què fa aquest botó tot sol?**
+   - **Buida la llista de PDFs pujats de cop** (no cal que vagis esborrant els fitxers un per un amb la petita `×`).
+   - **Neteja la taula de resultats i el visor** perquè no es barregin documents del lot vell amb el lot nou.
+   - **Esborra els fitxers temporals de treball** perquè l'ordinador no s'ompli de brossa, però **manté 100% intactes** tots els documents que ja has exportat i els dígits que hagis guardat per entrenar!
+
 **Ja està! Feina feta.** 🎉
 
 ---
@@ -160,3 +168,6 @@ Aquí li diem al programa quin número és cada imatge perquè aprengui:
 
 ### 5. *"Què passa si dos PDFs del mateix lot tenen exactament el mateix codi?"*
 - Tranquil, **mai s'esborrarà ni es trepitjarà cap document**. El primer es guardarà com `0529820.pdf` i el segon com `0529820_2.pdf` (o pots triar el patró `{codi}_{original}.ext` perquè es diguin `0529820_18.pdf` i `0529820_19.pdf`).
+
+### 6. *"Vull carregar un segon lot de PDFs però encara em surten els fitxers del lot anterior"*
+- Prem el botó **`🧹 Netejar / Següent Batch (Reset)`** (a la secció 3 o a la secció 4 de `07 · Run batch`). En un sol clic et deixarà el carregador i la taula completament buits i llestos per arrossegar la nova tanda de documents.

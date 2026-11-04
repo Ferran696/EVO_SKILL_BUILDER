@@ -53,6 +53,8 @@ from core.storage import (
     build_renamed_filenames,
     build_batch_export_zip,
     export_batch_to_folder,
+    cleanup_runtime_batch_dir,
+    reset_batch_session_state,
 )
 from core.locks import is_locked, read_lock
 from core.utils import load_first_page_image, crop_relative, draw_roi_overlay, split_fixed_slots, crop_box_pixels, draw_char_boxes_overlay, resize_for_zoom, trim_to_ink_bbox, slot_ink_ratio
@@ -1569,85 +1571,121 @@ elif page == "07 · Run batch":
         avg_conf_threshold = st.slider("Avg conf OK", 0.0, 1.0, 0.85, 0.05)
 
         st.markdown("### 3) Upload documents nous")
+
+        reset_flash = st.session_state.pop("batch_reset_flash", None)
+        if reset_flash:
+            st.success(reset_flash)
+
+        uploader_rev = int(st.session_state.get("batch_uploader_rev", 0))
         uploaded = st.file_uploader(
             "Puja documents nous per processar",
             type=["pdf", "png", "jpg", "jpeg", "tif", "tiff", "bmp"],
             accept_multiple_files=True,
+            key=f"batch_uploader_{pdir.name}_{uploader_rev}",
         )
+
+        has_active_batch = bool(st.session_state.get("run_batch_results")) or bool(uploaded)
 
         if uploaded:
             st.info(f"Documents pujats: {len(uploaded)}")
 
-            if st.button("▶️ Processar batch", type="primary", use_container_width=True):
-                try:
-                    run_dir = save_uploaded_batch_files(pdir, uploaded)
+        act_col1, act_col2 = st.columns([2.2, 1.0], gap="medium")
+        with act_col1:
+            run_clicked = st.button(
+                "▶️ Processar batch",
+                type="primary",
+                disabled=(not uploaded),
+                use_container_width=True,
+                key="btn_process_batch_main",
+            )
+        with act_col2:
+            if st.button(
+                "🧹 Netejar / Següent Batch (Reset)",
+                disabled=(not has_active_batch),
+                use_container_width=True,
+                help=(
+                    "Buida la llista de fitxers pujats, neteja la taula de resultats i el visor, "
+                    "i esborra els temporals d'execució mantenint intactes les exportacions i mostres."
+                ),
+                key="btn_reset_batch_top",
+            ):
+                cleanup_info = reset_batch_session_state(st.session_state, pdir=pdir, clean_disk_temp=True)
+                st.session_state["batch_reset_flash"] = (
+                    f"🧹 Lot netejat! Carregador buidat i eliminades {cleanup_info['removed_count']} carpeta(es) temporal(s). "
+                    "Ja pots arrossegar el següent batch de documents."
+                )
+                st.rerun()
 
-                    results = []
-                    detail_store = {}
+        if uploaded and run_clicked:
+            try:
+                run_dir = save_uploaded_batch_files(pdir, uploaded)
 
-                    progress = st.progress(0.0, text="Processant batch...")
+                results = []
+                detail_store = {}
 
-                    files = sorted([p for p in run_dir.iterdir() if p.is_file()])
+                progress = st.progress(0.0, text="Processant batch...")
 
-                    for i, path in enumerate(files, start=1):
-                        try:
-                            pred = predict_document_code_from_path(
-                                path=path,
-                                config=config,
-                                model=model,
-                                alphabet=alphabet,
-                                device=device,
-                                box_template=box_template,
-                                use_auto_trim=use_auto_trim,
-                                trim_threshold=trim_threshold,
-                                trim_pad=trim_pad,
-                                use_router=use_router,
-                                segmentation_method=segmentation_method,
-                                use_anchor=use_anchor,
-                                use_deskew=use_deskew,
-                            )
+                files = sorted([p for p in run_dir.iterdir() if p.is_file()])
 
-                            status = "OK" if (
-                                pred["min_conf"] >= min_conf_threshold
-                                and pred["avg_conf"] >= avg_conf_threshold
-                            ) else "REVIEW"
+                for i, path in enumerate(files, start=1):
+                    try:
+                        pred = predict_document_code_from_path(
+                            path=path,
+                            config=config,
+                            model=model,
+                            alphabet=alphabet,
+                            device=device,
+                            box_template=box_template,
+                            use_auto_trim=use_auto_trim,
+                            trim_threshold=trim_threshold,
+                            trim_pad=trim_pad,
+                            use_router=use_router,
+                            segmentation_method=segmentation_method,
+                            use_anchor=use_anchor,
+                            use_deskew=use_deskew,
+                        )
 
-                            row = {
-                                "exportar": status == "OK",
-                                "fitxer": pred["file"],
-                                "codi": pred["code"],
-                                "format": pred.get("format_name", "N/A"),
-                                "min_conf": round(pred["min_conf"], 4),
-                                "avg_conf": round(pred["avg_conf"], 4),
-                                "status": status,
-                            }
+                        status = "OK" if (
+                            pred["min_conf"] >= min_conf_threshold
+                            and pred["avg_conf"] >= avg_conf_threshold
+                        ) else "REVIEW"
 
-                            results.append(row)
-                            detail_store[pred["file"]] = pred
+                        row = {
+                            "exportar": status == "OK",
+                            "fitxer": pred["file"],
+                            "codi": pred["code"],
+                            "format": pred.get("format_name", "N/A"),
+                            "min_conf": round(pred["min_conf"], 4),
+                            "avg_conf": round(pred["avg_conf"], 4),
+                            "status": status,
+                        }
 
-                        except Exception as e:
-                            results.append({
-                                "exportar": False,
-                                "fitxer": path.name,
-                                "codi": "",
-                                "format": "ERROR",
-                                "min_conf": 0.0,
-                                "avg_conf": 0.0,
-                                "status": "ERROR",
-                                "error": str(e),
-                            })
+                        results.append(row)
+                        detail_store[pred["file"]] = pred
 
-                        progress.progress(i / max(1, len(files)), text=f"Processat {i}/{len(files)}")
+                    except Exception as e:
+                        results.append({
+                            "exportar": False,
+                            "fitxer": path.name,
+                            "codi": "",
+                            "format": "ERROR",
+                            "min_conf": 0.0,
+                            "avg_conf": 0.0,
+                            "status": "ERROR",
+                            "error": str(e),
+                        })
 
-                    st.session_state["run_batch_results"] = results
-                    st.session_state["run_batch_details"] = detail_store
-                    st.session_state["run_batch_dir"] = str(run_dir)
-                    st.session_state["run_batch_editor_rev"] = st.session_state.get("run_batch_editor_rev", 0) + 1
+                    progress.progress(i / max(1, len(files)), text=f"Processat {i}/{len(files)}")
 
-                    st.success("Batch processat.")
+                st.session_state["run_batch_results"] = results
+                st.session_state["run_batch_details"] = detail_store
+                st.session_state["run_batch_dir"] = str(run_dir)
+                st.session_state["run_batch_editor_rev"] = st.session_state.get("run_batch_editor_rev", 0) + 1
 
-                except Exception as e:
-                    st.error(f"Error processant batch: {e}")
+                st.success("Batch processat.")
+
+            except Exception as e:
+                st.error(f"Error processant batch: {e}")
 
         results = st.session_state.get("run_batch_results", [])
         details = st.session_state.get("run_batch_details", {})
@@ -1793,7 +1831,7 @@ elif page == "07 · Run batch":
 
             st.info(f"📌 **{n_selected} de {len(final_rows)}** documents seleccionats per reindexar i exportar.")
 
-            exp_col1, exp_col2, exp_col3 = st.columns([1.2, 1.2, 1.0], gap="medium")
+            exp_col1, exp_col2, exp_col3, exp_col4 = st.columns([1.2, 1.1, 1.0, 1.1], gap="medium")
 
             with exp_col1:
                 if run_batch_dir and Path(run_batch_dir).exists() and n_selected > 0:
@@ -1847,6 +1885,23 @@ elif page == "07 · Run batch":
                             st.success(f"Exportats {summary['copied_count']} fitxers a:\n`{summary['target_dir']}`")
                         except Exception as e:
                             st.error(f"Error exportant a carpeta: {e}")
+
+            with exp_col4:
+                if st.button(
+                    "🧹 Següent Batch (Reset)",
+                    use_container_width=True,
+                    help=(
+                        "Un cop exportat el lot, prem aquí per buidar el carregador de fitxers, "
+                        "netejar la taula i el visor, i eliminar els temporals per començar el següent batch."
+                    ),
+                    key="btn_reset_batch_bottom",
+                ):
+                    cleanup_info = reset_batch_session_state(st.session_state, pdir=pdir, clean_disk_temp=True)
+                    st.session_state["batch_reset_flash"] = (
+                        f"🧹 Lot finalitzat i netejat! Carregador buidat i eliminades {cleanup_info['removed_count']} carpeta(es) temporal(s). "
+                        "Ja pots arrossegar el següent batch de documents."
+                    )
+                    st.rerun()
 
             st.markdown("---")
             st.markdown("### 5) Estació de Revisió Ràpida (`REVIEW`) i Detall Visual")

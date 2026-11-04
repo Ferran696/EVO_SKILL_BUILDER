@@ -236,3 +236,68 @@ def export_batch_to_folder(source_dir: Path, target_dir: Path, rows: list) -> di
         "files": copied_files,
         "index_csv": str(index_path),
     }
+
+
+def cleanup_runtime_batch_dir(
+    pdir: Path,
+    run_batch_dir: str | Path = None,
+    clean_all_runtime: bool = False,
+) -> dict:
+    """
+    Elimina de forma segura els fitxers temporals d'execució de `runtime_batches`
+    sense tocar mai `exports/`, `samples/`, `uploads/` ni `labels.csv`.
+    """
+    pdir = Path(pdir).resolve()
+    runtime_root = (pdir / "runtime_batches").resolve()
+    removed_dirs = []
+
+    if not runtime_root.exists():
+        return {"removed_count": 0, "removed_dirs": []}
+
+    if clean_all_runtime:
+        for child in sorted(runtime_root.iterdir()):
+            if child.is_dir() and child.resolve().parent == runtime_root:
+                shutil.rmtree(child, ignore_errors=True)
+                removed_dirs.append(str(child))
+    elif run_batch_dir:
+        candidate = Path(run_batch_dir).resolve()
+        if candidate.exists() and candidate.is_dir() and candidate.parent == runtime_root:
+            shutil.rmtree(candidate, ignore_errors=True)
+            removed_dirs.append(str(candidate))
+
+    return {
+        "removed_count": len(removed_dirs),
+        "removed_dirs": removed_dirs,
+    }
+
+
+def reset_batch_session_state(
+    session_state,
+    pdir: Path = None,
+    clean_disk_temp: bool = True,
+) -> dict:
+    """
+    Reseteja tot l'estat del batch a `session_state` (taula de resultats, visor REVIEW,
+    comptador de revisió del `file_uploader` perquè quedi buit) i opcionalment
+    elimina els temporals de `runtime_batches`.
+    """
+    old_run_dir = session_state.get("run_batch_dir", "")
+    cleanup_info = {"removed_count": 0, "removed_dirs": []}
+
+    if clean_disk_temp and pdir is not None:
+        cleanup_info = cleanup_runtime_batch_dir(
+            pdir=Path(pdir),
+            run_batch_dir=old_run_dir if old_run_dir else None,
+            clean_all_runtime=True,
+        )
+
+    session_state.pop("run_batch_results", None)
+    session_state.pop("run_batch_details", None)
+    session_state.pop("run_batch_dir", None)
+    session_state.pop("batch_review_selected_file", None)
+    session_state.pop("batch_review_flash", None)
+
+    session_state["batch_uploader_rev"] = int(session_state.get("batch_uploader_rev", 0)) + 1
+    session_state["run_batch_editor_rev"] = int(session_state.get("run_batch_editor_rev", 0)) + 1
+
+    return cleanup_info

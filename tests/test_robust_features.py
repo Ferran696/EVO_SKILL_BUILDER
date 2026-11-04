@@ -18,6 +18,8 @@ from core.storage import (
     build_renamed_filenames,
     build_batch_export_zip,
     export_batch_to_folder,
+    cleanup_runtime_batch_dir,
+    reset_batch_session_state,
 )
 from core.labels import (
     apply_manual_review_update,
@@ -324,6 +326,44 @@ class RobustFeaturesTests(unittest.TestCase):
         )
         self.assertEqual(res_override["roi"], custom_roi)
         self.assertEqual(res_override["code"], "517932")
+
+    def test_reset_batch_session_state_and_cleanup_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pdir = Path(tmp)
+            runtime_dir = pdir / "runtime_batches" / "20261104_170000"
+            exports_dir = pdir / "exports" / "20261104_170000"
+            samples_dir = pdir / "samples" / "5"
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            exports_dir.mkdir(parents=True, exist_ok=True)
+            samples_dir.mkdir(parents=True, exist_ok=True)
+
+            (runtime_dir / "18.pdf").write_bytes(b"%PDF-1.4 temp")
+            (exports_dir / "0529820.pdf").write_bytes(b"%PDF-1.4 exported")
+            (samples_dir / "sample.png").write_bytes(b"PNG")
+
+            mock_session = {
+                "run_batch_results": [{"fitxer": "18.pdf", "codi": "0529820"}],
+                "run_batch_details": {"18.pdf": {"code": "0529820"}},
+                "run_batch_dir": str(runtime_dir),
+                "batch_review_selected_file": "18.pdf",
+                "batch_uploader_rev": 2,
+                "run_batch_editor_rev": 4,
+            }
+
+            info = reset_batch_session_state(mock_session, pdir=pdir, clean_disk_temp=True)
+            self.assertEqual(info["removed_count"], 1)
+            self.assertFalse(runtime_dir.exists())
+            # Exports i samples han de romandre 100% intactes
+            self.assertTrue((exports_dir / "0529820.pdf").exists())
+            self.assertTrue((samples_dir / "sample.png").exists())
+
+            # Session state net i comptadors incrementats
+            self.assertNotIn("run_batch_results", mock_session)
+            self.assertNotIn("run_batch_details", mock_session)
+            self.assertNotIn("run_batch_dir", mock_session)
+            self.assertNotIn("batch_review_selected_file", mock_session)
+            self.assertEqual(mock_session["batch_uploader_rev"], 3)
+            self.assertEqual(mock_session["run_batch_editor_rev"], 5)
 
 
 if __name__ == "__main__":
