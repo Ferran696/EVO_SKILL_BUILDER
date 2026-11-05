@@ -3,7 +3,12 @@ from pathlib import Path
 from PIL import Image
 import torch
 
-from core.router import classify_document_format, FORMAT_DEFINITIONS
+from core.router import (
+    classify_document_format,
+    FORMAT_DEFINITIONS,
+    is_project_router_enabled,
+    get_document_roi_and_format,
+)
 from core.segmentation import auto_split_characters_by_x_histogram
 from core.utils import load_first_page_image, crop_relative
 from app import predict_document_code_from_path, load_trained_model_for_project, load_project_config
@@ -124,6 +129,22 @@ class RouterAndSegmentationTests(unittest.TestCase):
 
         truth_6 = "515159"
         self.assertEqual(len(truth_6), res11["expected_length"])
+
+    def test_ten_digit_project_uses_fixed_length_and_project_roi(self):
+        blank_img = Image.new("RGB", (600, 800), (255, 255, 255))
+        custom_roi = {"x0": 0.635, "y0": 0.17, "x1": 0.735, "y1": 0.19}
+        config_10 = {
+            "project_id": "albarans_10",
+            "fixed_length": 10,
+            "roi": custom_roi,
+        }
+        self.assertFalse(is_project_router_enabled(config_10))
+        res = get_document_roi_and_format(blank_img, config=config_10)
+        self.assertEqual(res["format_id"], "project_fixed")
+        self.assertEqual(res["expected_length"], 10)
+        self.assertEqual(res["roi"], custom_roi)
+        self.assertFalse(res["filter_dots"])
+        self.assertFalse(res["router_active"])
 
 
 if __name__ == "__main__":

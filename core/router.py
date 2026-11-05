@@ -3,7 +3,7 @@ Mòdul d'enrutament i classificació automàtica de formats de document.
 Identifica la plantilla del document (Tipus 1: Codi de barres, Tipus 2: Logo, Tipus 3: Excepció/Punts)
 per aplicar la ROI, longitud esperada i regles de segmentació adequades.
 """
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 from PIL import Image
 import numpy as np
 import cv2
@@ -335,4 +335,68 @@ def classify_document_format(
             "anchor_crop_size": tr_crop.size,
             "anchor": anchor_debug,
         },
+    }
+
+
+def is_project_router_enabled(config: Optional[Dict[str, Any]]) -> bool:
+    """
+    Determina si un projecte utilitza l'enrutador multi-format de Carburos (Tipus 1/2/3 de 6-7 dígits)
+    o bé la ROI i longitud fixa pròpies del projecte (p. ex. 10 dígits).
+    """
+    if not config:
+        return True
+    if "use_router" in config and config["use_router"] is not None:
+        return bool(config["use_router"])
+    fixed_len = int(config.get("fixed_length", 0) or 0)
+    return fixed_len in (6, 7)
+
+
+def get_document_roi_and_format(
+    img: Image.Image,
+    config: Optional[Dict[str, Any]] = None,
+    use_router: Optional[bool] = None,
+    auto_anchor: bool = False,
+) -> Dict[str, Any]:
+    """
+    Resol la ROI, la longitud esperada i les opcions de format d'un document segons la configuració del projecte.
+    - Si el Router multi-format està actiu (Carburos 6/7 dígits), classifica automàticament en Tipus 1, 2 o 3.
+    - Si està desactivat (p. ex. projectes de 10 dígits o amb ROI única), retorna la ROI i `fixed_length` del projecte.
+    """
+    cfg = config or {}
+    router_enabled = is_project_router_enabled(cfg) if use_router is None else bool(use_router)
+
+    if router_enabled:
+        res = classify_document_format(
+            img,
+            custom_rois=cfg.get("custom_rois"),
+            auto_anchor=auto_anchor,
+        )
+        res["router_active"] = True
+        return res
+
+    fixed_len = int(cfg.get("fixed_length", 7) or 7)
+    base_roi = cfg.get("roi") or {
+        "x0": 0.50,
+        "y0": 0.00,
+        "x1": 0.98,
+        "y1": 0.25,
+    }
+    filter_dots = bool(cfg.get("filter_dots", False))
+    fmt_info = {
+        "id": "project_fixed",
+        "name": f"Format fix del projecte ({fixed_len} caràcters)",
+        "description": "ROI única i longitud fixa definides a la configuració del projecte.",
+        "expected_length": fixed_len,
+        "default_roi": base_roi,
+        "filter_dots": filter_dots,
+    }
+    return {
+        "format_id": "project_fixed",
+        "format_info": fmt_info,
+        "roi": base_roi,
+        "expected_length": fixed_len,
+        "filter_dots": filter_dots,
+        "confidence": 1.0,
+        "router_active": False,
+        "debug": {"mode": "project_fixed"},
     }

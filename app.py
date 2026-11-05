@@ -62,7 +62,13 @@ import core.router as _router_mod
 import core.segmentation as _segmentation_mod
 importlib.reload(_router_mod)
 importlib.reload(_segmentation_mod)
-from core.router import classify_document_format, FORMAT_DEFINITIONS, locate_anchor_and_adjust_roi
+from core.router import (
+    classify_document_format,
+    FORMAT_DEFINITIONS,
+    locate_anchor_and_adjust_roi,
+    is_project_router_enabled,
+    get_document_roi_and_format,
+)
 from core.segmentation import (
     auto_split_characters_by_x_histogram,
     extract_characters_by_connected_components,
@@ -421,9 +427,9 @@ def predict_document_code_from_path(
         img, deskew_angle = deskew_image(img)
 
     if use_router:
-        format_result = classify_document_format(
+        format_result = get_document_roi_and_format(
             img,
-            custom_rois=config.get("custom_rois"),
+            config=config,
             auto_anchor=(use_anchor and override_roi is None),
         )
         roi = override_roi if override_roi is not None else format_result["roi"]
@@ -676,11 +682,49 @@ elif page == "03 · ROI bàsica":
             img = load_first_page_image(path, dpi=130)
             w, h = img.size
 
-            doc_fmt = classify_document_format(img, custom_rois=config.get("custom_rois"))
-            fmt_info = doc_fmt["format_info"]
-            st.info(f"Format detectat pel Router: **{fmt_info['name']}** (Longitud esperada: **{doc_fmt['expected_length']}** caràcters)")
+            cfg_col1, cfg_col2, cfg_col3 = st.columns([1.0, 1.6, 1.0])
+            with cfg_col1:
+                cfg_fixed_len = st.number_input(
+                    "Longitud fixa del camp (dígits/caràcters)",
+                    min_value=1,
+                    max_value=64,
+                    value=int(config.get("fixed_length", 7) or 7),
+                    step=1,
+                    key=f"roi_fixed_len_{pdir.name}",
+                )
+            with cfg_col2:
+                default_router_on = is_project_router_enabled(
+                    {**config, "fixed_length": int(cfg_fixed_len)}
+                )
+                use_router_cfg = st.checkbox(
+                    "🔄 Activar Router Multi-Format Carburos (6-7 dígits: Tipus 1/2/3)",
+                    value=default_router_on,
+                    help="Desmarca aquesta opció per utilitzar la ROI única i la longitud fixa configurada al projecte (p. ex. 10 dígits).",
+                    key=f"roi_use_router_{pdir.name}",
+                )
+            with cfg_col3:
+                cfg_filter_dots = st.checkbox(
+                    "Filtrar punts separadors",
+                    value=bool(config.get("filter_dots", False)),
+                    disabled=use_router_cfg,
+                    help="Descarta punts decimals o separadors de milers durant la segmentació.",
+                    key=f"roi_filter_dots_{pdir.name}",
+                )
 
-            current_roi = doc_fmt["roi"] or config.get("roi") or {
+            effective_cfg = {
+                **config,
+                "fixed_length": int(cfg_fixed_len),
+                "use_router": bool(use_router_cfg),
+                "filter_dots": bool(cfg_filter_dots),
+            }
+            doc_fmt = get_document_roi_and_format(img, config=effective_cfg, use_router=use_router_cfg)
+            fmt_info = doc_fmt["format_info"]
+            if use_router_cfg:
+                st.info(f"Format detectat pel Router: **{fmt_info['name']}** (Longitud esperada: **{doc_fmt['expected_length']}** caràcters)")
+            else:
+                st.info(f"📌 **Mode ROI única del projecte** · Longitud esperada: **{doc_fmt['expected_length']}** caràcters")
+
+            current_roi = (doc_fmt["roi"] if use_router_cfg else config.get("roi")) or config.get("roi") or {
                 "x0": 0.50,
                 "y0": 0.00,
                 "x1": 0.98,
@@ -735,12 +779,19 @@ elif page == "03 · ROI bàsica":
 
                 if st.button("💾 Guardar ROI", type="primary", use_container_width=True):
                     config["roi"] = roi
-                    if "custom_rois" not in config or not isinstance(config["custom_rois"], dict):
-                        config["custom_rois"] = {}
-                    config["custom_rois"][doc_fmt["format_id"]] = roi
+                    config["fixed_length"] = int(cfg_fixed_len)
+                    config["use_router"] = bool(use_router_cfg)
+                    config["filter_dots"] = bool(cfg_filter_dots)
+                    if use_router_cfg:
+                        if "custom_rois" not in config or not isinstance(config["custom_rois"], dict):
+                            config["custom_rois"] = {}
+                        config["custom_rois"][doc_fmt["format_id"]] = roi
                     config["status"] = "roi_defined"
                     save_project_config(pdir, config)
-                    st.success(f"ROI guardada per al format {fmt_info['name']}.")
+                    if use_router_cfg:
+                        st.success(f"ROI guardada per al format {fmt_info['name']}.")
+                    else:
+                        st.success(f"ROI i longitud fixa ({int(cfg_fixed_len)} caràcters) guardades per al projecte.")
                     st.json(roi)
 
             with c_img:
@@ -867,7 +918,7 @@ elif page == "04 · Dataset / labeling":
             if st.button("Executar VLM per obtenir caixes", disabled=not vlm_api_key):
                 path_vlm = next(p for p in docs if p.name == doc_vlm)
                 img_vlm = load_first_page_image(path_vlm, dpi=150)
-                vlm_fmt = classify_document_format(img_vlm, custom_rois=config.get("custom_rois"))
+                vlm_fmt = get_document_roi_and_format(img_vlm, config=config)
                 vlm_expected_len = vlm_fmt.get("expected_length", fixed_length)
                 vlm_roi = vlm_fmt.get("roi", roi)
                 crop_vlm = crop_relative(img_vlm, vlm_roi)
@@ -914,7 +965,7 @@ elif page == "04 · Dataset / labeling":
             path = next(p for p in docs if p.name == doc)
 
             img = load_first_page_image(path, dpi=150)
-            doc_fmt = classify_document_format(img, custom_rois=config.get("custom_rois"))
+            doc_fmt = get_document_roi_and_format(img, config=config)
             doc_expected_len = doc_fmt.get("expected_length", fixed_length)
             doc_roi = doc_fmt.get("roi", roi)
             st.info(f"Format detectat: **{doc_fmt['format_info']['name']}** (Esperats: **{doc_expected_len}** caràcters)")
@@ -1067,7 +1118,7 @@ elif page == "04 · Dataset / labeling":
         path = next(p for p in docs if p.name == doc)
 
         img = load_first_page_image(path, dpi=150)
-        doc_fmt = classify_document_format(img, custom_rois=config.get("custom_rois"))
+        doc_fmt = get_document_roi_and_format(img, config=config)
         doc_expected_len = doc_fmt.get("expected_length", fixed_length)
         doc_roi = doc_fmt.get("roi", roi)
         st.info(f"Format detectat: **{doc_fmt['format_info']['name']}** (Esperats: **{doc_expected_len}** caràcters)")
@@ -1096,10 +1147,15 @@ elif page == "04 · Dataset / labeling":
 
         cw, ch = crop.size
 
+        example_truth = (
+            "0528158"
+            if doc_expected_len == 7
+            else ("515159" if doc_expected_len == 6 else "8112071160"[:doc_expected_len].ljust(doc_expected_len, "0"))
+        )
         truth_raw = st.text_input(
             f"Valor real complet ({doc_expected_len} caràcters per a {doc_fmt['format_info']['name']})",
             key=f"truth_canvas_{pdir.name}_{path.name}",
-            placeholder=f"P.ex. {'0528158' if doc_expected_len == 7 else '515159'}",
+            placeholder=f"P.ex. {example_truth}",
         )
 
         truth = "".join([c for c in truth_raw.strip().upper() if c in alphabet])

@@ -1,0 +1,33 @@
+{
+  "project_id": "albarans_mecanitzats_scan_20260917_132444",
+  "project_name": "ALBARANS MECANITZATS SCAN",
+  "department": "SCAN",
+  "field_name": "Nº de albarán",
+  "alphabet": "0123456789",
+  "fixed_length": 10,
+  "use_router": false,
+  "filter_dots": false,
+  "roi": {
+    "x0": 0.635,
+    "y0": 0.17,
+    "x1": 0.735,
+    "y1": 0.19
+  },
+  "segmentation_mode": "fixed_slots",
+  "status": "trained_demo",
+  "created_at": "2026-09-17T13:24:44",
+  "custom_rois": {
+    "format_3_exception": {
+      "x0": 0.635,
+      "y0": 0.17,
+      "x1": 0.735,
+      "y1": 0.19
+    },
+    "project_fixed": {
+      "x0": 0.46,
+      "y0": 0.32,
+      "x1": 0.57,
+      "y1": 0.34
+    }
+  }
+}

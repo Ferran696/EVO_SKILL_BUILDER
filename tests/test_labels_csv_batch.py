@@ -3,7 +3,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from core.labels import LABELS_CSV_FIELDS, append_label_rows, build_box_template_from_labels
+from core.labels import (
+    LABELS_CSV_FIELDS,
+    LEGACY_CANVAS_FIELDS,
+    append_label_rows,
+    build_box_template_from_labels,
+    migrate_legacy_labels_csv,
+)
 from streamlit.testing.v1 import AppTest
 
 
@@ -106,6 +112,23 @@ class LabelsCsvBatchTests(unittest.TestCase):
             labels_csv.write_text("old,header\n", encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "Normalitza o migra"):
                 append_label_rows(labels_csv, [self.make_row("canvas_manual", 1)])
+
+    def test_writer_auto_migrates_legacy_21_column_canvas_header(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            labels_csv = Path(temp_dir) / "labels.csv"
+            legacy_row = self.make_row("canvas_manual", 1)
+            with labels_csv.open("w", newline="", encoding="utf-8") as file:
+                writer = csv.DictWriter(file, fieldnames=LEGACY_CANVAS_FIELDS, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerow(legacy_row)
+
+            append_label_rows(labels_csv, [self.make_row("canvas_manual", 2)])
+
+            with labels_csv.open("r", newline="", encoding="utf-8") as file:
+                records = list(csv.reader(file))
+            self.assertEqual(records[0], LABELS_CSV_FIELDS)
+            self.assertEqual(len(records), 3)
+            self.assertTrue((Path(temp_dir) / "labels.csv.bak").exists())
 
     def test_invalid_box_is_reported_with_csv_row(self):
         with tempfile.TemporaryDirectory() as temp_dir:

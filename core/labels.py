@@ -1,6 +1,9 @@
 import csv
 import datetime
+import os
 import re
+import shutil
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -17,18 +20,87 @@ LABELS_CSV_FIELDS = [
     "hist_pad_x", "hist_pad_y", "hist_apply_morph_open", "hist_apply_morph_close",
 ]
 
+LEGACY_CANVAS_FIELDS = LABELS_CSV_FIELDS[:21]
+LEGACY_AUTO_FIELDS = [
+    "timestamp", "project_id", "source_doc", "truth", "pos", "label", "image_path", "mode", "ink_ratio",
+    "box_x0", "box_y0", "box_x1", "box_y2", "roi_x0", "roi_y0", "roi_x1", "roi_y1",
+    "hist_threshold_method", "hist_min_char_width", "hist_min_ink_per_col", "hist_gap_merge_px",
+    "hist_pad_x", "hist_pad_y", "hist_apply_morph_open", "hist_apply_morph_close",
+]
+
+
+def migrate_legacy_labels_csv(labels_csv: Path) -> bool:
+    """
+    Migra automàticament un fitxer labels.csv amb l'esquema antic (21 o 24 columnes)
+    a l'esquema compartit actual de 29 columnes (`LABELS_CSV_FIELDS`), creant `labels.csv.bak` si no existeix.
+    Retorna True si s'ha migrat o ja estava en l'esquema actual, o False si l'esquema és desconegut/invàlid.
+    """
+    labels_csv = Path(labels_csv)
+    if not labels_csv.exists() or labels_csv.stat().st_size == 0:
+        return True
+
+    with labels_csv.open("r", newline="", encoding="utf-8-sig") as source:
+        reader = csv.reader(source)
+        header = next(reader, [])
+        if header == LABELS_CSV_FIELDS:
+            return True
+        if header not in (LEGACY_CANVAS_FIELDS, LEGACY_AUTO_FIELDS):
+            return False
+
+        normalized_rows = []
+        for row_number, values in enumerate(reader, start=2):
+            if not values:
+                continue
+            if len(values) == len(LABELS_CSV_FIELDS):
+                row_dict = dict(zip(LABELS_CSV_FIELDS, values))
+            elif len(values) == len(header):
+                row_dict = dict(zip(header, values))
+            elif len(values) == len(LEGACY_AUTO_FIELDS):
+                row_dict = dict(zip(LEGACY_AUTO_FIELDS, values))
+            elif len(values) == len(LEGACY_CANVAS_FIELDS):
+                row_dict = dict(zip(LEGACY_CANVAS_FIELDS, values))
+            else:
+                return False
+
+            if "box_y2" in row_dict and not row_dict.get("box_y1"):
+                row_dict["box_y1"] = row_dict.pop("box_y2")
+
+            normalized_rows.append({field: row_dict.get(field, "") for field in LABELS_CSV_FIELDS})
+
+    backup_csv = labels_csv.with_suffix(".csv.bak")
+    if not backup_csv.exists():
+        shutil.copy2(labels_csv, backup_csv)
+
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", newline="", encoding="utf-8", dir=labels_csv.parent, delete=False
+        ) as destination:
+            temp_path = Path(destination.name)
+            writer = csv.DictWriter(destination, fieldnames=LABELS_CSV_FIELDS, extrasaction="raise")
+            writer.writeheader()
+            writer.writerows(normalized_rows)
+        os.replace(temp_path, labels_csv)
+        temp_path = None
+    finally:
+        if temp_path and temp_path.exists():
+            temp_path.unlink()
+
+    return True
+
 
 def append_label_rows(labels_csv: Path, rows: list[dict]) -> None:
     """Append labels using the shared schema for all labeling modes."""
     write_header = not labels_csv.exists() or labels_csv.stat().st_size == 0
     if not write_header:
-        with labels_csv.open("r", newline="", encoding="utf-8") as file:
+        with labels_csv.open("r", newline="", encoding="utf-8-sig") as file:
             existing_fields = next(csv.reader(file), [])
         if existing_fields != LABELS_CSV_FIELDS:
-            raise RuntimeError(
-                "L'esquema de labels.csv no coincideix amb el format actual. "
-                "Normalitza o migra el fitxer abans de continuar."
-            )
+            if not migrate_legacy_labels_csv(labels_csv):
+                raise RuntimeError(
+                    "L'esquema de labels.csv no coincideix amb el format actual. "
+                    "Normalitza o migra el fitxer abans de continuar."
+                )
 
     with labels_csv.open("a", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=LABELS_CSV_FIELDS, extrasaction="raise")
